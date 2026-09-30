@@ -11,7 +11,7 @@ Notes:
 ## Clean Flash:
 1. Download the ROM
 2. Flash the dynamic recovery provided (recovery.img is inside the ROM zip). fastboot flash recovery <recovery.img>
-3. If fastboot dissapears (it is in waiting for device), you have to connect cable via some usb hub, that will increase electric current.
+3. If fastboot disappears (it is in waiting for device), you have to connect cable via some usb hub, that will increase electric current.
 5. Boot into recovery 
 6. Apply Update > Sideload ROM > adb sideload <ROM.zip> (or you can use SD Card)
 8. Format DATA (only for first time to enable DATA encryption, for updates it is not needed)
