@@ -5,6 +5,8 @@ Notes:
 * Enforced and encrypted
 * With [SukiSU](https://github.com/SukiSU-Ultra/SukiSU-Ultra)
 * With [MindTheGapps](https://github.com/MindTheGapps/16.0.0-arm64)
+* With [Kernel](https://github.com/user-why-red/android_kernel_xiaomi_sdm660_419)
+* With Whyred repos from [NopeNopeGuy](https://github.com/NopeNopeGuy) [Whyred](https://github.com/Bouquet-Dynamic-Development)
 
 ## Clean Flash:
 1. Download the ROM
@@ -14,7 +16,3 @@ Notes:
 6. Apply Update > Sideload ROM > adb sideload <ROM.zip> (or you can use SD Card)
 8. Format DATA (only for first time to enable DATA encryption, for updates it is not needed)
 9. Reboot and enjoy!
-
-Thanks to 
-[@NopeNopeGuy](https://github.com/NopeNopeGuy)
-This ROM is based on his repositories
