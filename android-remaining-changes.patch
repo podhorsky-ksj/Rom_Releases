@@ -1,0 +1,1779 @@
+diff --git a/bootable/recovery/volume_manager/PublicVolume.cpp b/bootable/recovery/volume_manager/PublicVolume.cpp
+index b04135fd07a99669ffd5967281eb509af4af8175..cea34ffcf30a6993e305ab98632e61c826401609 100644
+--- a/bootable/recovery/volume_manager/PublicVolume.cpp
++++ b/bootable/recovery/volume_manager/PublicVolume.cpp
+@@ -31,6 +31,7 @@
+ #include <cutils/fs.h>
+ #include <private/android_filesystem_config.h>
+ 
++#include <algorithm>
+ #include <fcntl.h>
+ #include <stdlib.h>
+ #include <sys/mount.h>
+diff --git a/bootable/recovery/volume_manager/include/volume_manager/VolumeManager.h b/bootable/recovery/volume_manager/include/volume_manager/VolumeManager.h
+index c2cb8dde9b0c6adbd51bd8f69e7d76cd2caf1a3d..74d653b34d6ff04fef8f7dc22150e8b47fc6f3ea 100644
+--- a/bootable/recovery/volume_manager/include/volume_manager/VolumeManager.h
++++ b/bootable/recovery/volume_manager/include/volume_manager/VolumeManager.h
+@@ -25,6 +25,7 @@
+ #include <list>
+ #include <mutex>
+ #include <string>
++#include <vector>
+ 
+ struct selabel_handle;
+ class NetlinkManager;
+diff --git a/build/make/tools/aconfig/aconfig_storage_file/src/lib.rs b/build/make/tools/aconfig/aconfig_storage_file/src/lib.rs
+index fc9499fbc9131db978d293f2c20c5693ed19082a..a588dea7e061e7123eac6c305da806353a4c422c 100644
+--- a/build/make/tools/aconfig/aconfig_storage_file/src/lib.rs
++++ b/build/make/tools/aconfig/aconfig_storage_file/src/lib.rs
+@@ -277,11 +277,15 @@ pub fn read_u32_from_start_of_bytes(buf: &[u8]) -> Result<u32, AconfigStorageErr
+ 
+ /// Read and parse bytes as u32
+ pub fn read_u32_from_bytes(buf: &[u8], head: &mut usize) -> Result<u32, AconfigStorageError> {
++    let end = head.checked_add(4).ok_or_else(|| BytesParseFail(anyhow!("u32 offset overflow")))?;
++    let bytes = buf
++        .get(*head..end)
++        .ok_or_else(|| BytesParseFail(anyhow!("incomplete u32 at offset {}", head)))?;
+     let val =
+-        u32::from_le_bytes(buf[*head..*head + 4].try_into().map_err(|errmsg| {
++        u32::from_le_bytes(bytes.try_into().map_err(|errmsg| {
+             BytesParseFail(anyhow!("fail to parse u32 from bytes: {}", errmsg))
+         })?);
+-    *head += 4;
++    *head = end;
+     Ok(val)
+ }
+ 
+@@ -581,6 +585,24 @@ pub fn list_flags_with_info_cxx(
+ 
+ #[cfg(test)]
+ mod tests {
++    #[test]
++    fn test_read_u32_rejects_incomplete_input_without_panicking() {
++        for length in 0..4 {
++            let bytes = vec![0; length];
++            let mut head = 0;
++            assert!(super::read_u32_from_bytes(&bytes, &mut head).is_err());
++            assert_eq!(head, 0);
++        }
++        for offset in [5, usize::MAX] {
++            let mut head = offset;
++            assert!(super::read_u32_from_bytes(&[0; 4], &mut head).is_err());
++            assert_eq!(head, offset);
++        }
++        let mut head = 1;
++        assert_eq!(super::read_u32_from_bytes(&[0, 1, 2, 3, 4], &mut head).unwrap(), 0x04030201);
++        assert_eq!(head, 5);
++    }
++
+     use super::*;
+     use crate::test_utils::{
+         create_test_flag_info_list, create_test_flag_table, create_test_flag_value_list,
+diff --git a/build/make/tools/releasetools/build_image.py b/build/make/tools/releasetools/build_image.py
+index 4d59ceee40adc4258d87d54b7fd63078bae996e9..c6adade6f1d7ff4477b4a03c11ce3d8304fc5541 100755
+--- a/build/make/tools/releasetools/build_image.py
++++ b/build/make/tools/releasetools/build_image.py
+@@ -692,6 +692,10 @@ def ImagePropFromGlobalDict(glob_dict, mount_point):
+     glob_dict: the global dictionary from the build system.
+     mount_point: such as "system", "data" etc.
+   """
++  # Partition images may be built concurrently from the same global dictionary.
++  # Parsing derived properties must not mutate other workers' input or invalidate
++  # their fingerprint iterators.
++  glob_dict = glob_dict.copy()
+   d = {}
+   TryParseFingerprintAndTimestamp(glob_dict)
+ 
+diff --git a/build/make/tools/releasetools/test_build_image.py b/build/make/tools/releasetools/test_build_image.py
+index d4f7ccc98f65c04f343d02689538ce03249cb1f3..1a2999b908c5d0fbc1aa594d7e551a87c9561e43 100644
+--- a/build/make/tools/releasetools/test_build_image.py
++++ b/build/make/tools/releasetools/test_build_image.py
+@@ -21,11 +21,26 @@ import common
+ import test_utils
+ from build_image import (
+     BuildImageError, CheckHeadroom, GetFilesystemCharacteristics,
+-    SetUpInDirAndFsConfig)
++    ImagePropFromGlobalDict, SetUpInDirAndFsConfig)
+ 
+ 
+ class BuildImageTest(test_utils.ReleaseToolsTestCase):
+ 
++  def test_ImagePropFromGlobalDict_doesNotMutateSharedInput(self):
++    glob_dict = {
++        'avb_system_add_hashtree_footer_args':
++            '--prop com.android.build.system.fingerprint:test/fingerprint',
++        'use_fixed_timestamp': 'true',
++        'system_fs_type': 'ext4',
++        'product_fs_type': 'ext4',
++    }
++    original = glob_dict.copy()
++    for mount_point in ('system', 'product', 'system_ext', 'vendor'):
++      image_props = ImagePropFromGlobalDict(glob_dict, mount_point)
++      self.assertEqual('test/fingerprint', image_props['fingerprint'])
++      self.assertEqual('1230768000', image_props['timestamp'])
++      self.assertEqual(original, glob_dict)
++
+   # Available: 1000 blocks.
+   EXT4FS_OUTPUT = (
+       "Created filesystem with 2777/129024 inodes and 515099/516099 blocks")
+diff --git a/external/XMP-Toolkit-SDK/Android.bp b/external/XMP-Toolkit-SDK/Android.bp
+index 285475c0ee4292f35a63493a5a0a716d8a70eec4..2770b554b629464e68dd7f5ba1b95cc9659c8d90 100644
+--- a/external/XMP-Toolkit-SDK/Android.bp
++++ b/external/XMP-Toolkit-SDK/Android.bp
+@@ -16,6 +16,7 @@ license {
+ cc_library {
+     name: "zuid_md5",
+     host_supported: true,
++    vendor_available: true,
+     sdk_version: "current",
+     stl: "c++_shared",
+     target: {
+@@ -37,6 +38,7 @@ cc_library {
+ cc_library {
+     name: "xmp_toolkit_sdk",
+     host_supported: true,
++    vendor_available: true,
+     sdk_version: "current",
+     stl: "c++_shared",
+     export_include_dirs: [
+diff --git a/external/google-highway/Android.bp b/external/google-highway/Android.bp
+index b2febd1e0f7c8d52ff932a56eac8cd7f258ea6d1..c907cd60ab45ed1ec19ac9deb5821de5f2e11b31 100644
+--- a/external/google-highway/Android.bp
++++ b/external/google-highway/Android.bp
+@@ -35,6 +35,7 @@ cc_library_headers {
+ cc_library {
+     name: "libhwy",
+     host_supported: true,
++    vendor_available: true,
+     sdk_version: "current",
+     stl: "c++_shared",
+     export_include_dirs: [
+diff --git a/external/skia/Android.bp b/external/skia/Android.bp
+index ff23e9642545e6061d046b8a9655371fd756fe41..026bb79e83f11acf03a18109e6ee4e23e3af6986 100644
+--- a/external/skia/Android.bp
++++ b/external/skia/Android.bp
+@@ -1158,6 +1158,7 @@ gensrcs {
+ cc_library_static {
+     name: "libskia_skcms",
+     host_supported: true,
++    vendor_available: true,
+     sdk_version: "current",
+     srcs: [
+         "modules/skcms/skcms.cc",
+diff --git a/frameworks/av/media/libaudiohal/Android.bp b/frameworks/av/media/libaudiohal/Android.bp
+index 09f4282c0568df455c5aae10fa90c1bf297b46a3..9f37e6c742a73b8d380fee7ced6aae1839d2f323 100644
+--- a/frameworks/av/media/libaudiohal/Android.bp
++++ b/frameworks/av/media/libaudiohal/Android.bp
+@@ -23,6 +23,7 @@ cc_library_shared {
+     ],
+ 
+     required: [
++        "libaudiohal@5.0",
+         "libaudiohal@6.0",
+         "libaudiohal@7.0",
+         "libaudiohal@7.1",
+diff --git a/frameworks/av/media/libaudiohal/FactoryHal.cpp b/frameworks/av/media/libaudiohal/FactoryHal.cpp
+index 2c30693a6147aa6fdb31a6edf032fe4d22ff981a..76e4403d82d8a53b2eee4993ffc7d4fb21b0ef1c 100644
+--- a/frameworks/av/media/libaudiohal/FactoryHal.cpp
++++ b/frameworks/av/media/libaudiohal/FactoryHal.cpp
+@@ -50,11 +50,13 @@ using InterfaceName = std::pair<std::string, std::string>;
+  * This list need to keep sync with AudioHalVersionInfo.VERSIONS in
+  * media/java/android/media/AudioHalVersionInfo.java.
+  */
+-static const std::array<AudioHalVersionInfo, 4> sAudioHALVersions = {
++static const std::array<AudioHalVersionInfo, 5> sAudioHALVersions = {
+     AudioHalVersionInfo(AudioHalVersionInfo::Type::AIDL, 1, 0),
+     AudioHalVersionInfo(AudioHalVersionInfo::Type::HIDL, 7, 1),
+     AudioHalVersionInfo(AudioHalVersionInfo::Type::HIDL, 7, 0),
+     AudioHalVersionInfo(AudioHalVersionInfo::Type::HIDL, 6, 0),
++    // Whyred's vendor HAL still exposes HIDL 5.0.
++    AudioHalVersionInfo(AudioHalVersionInfo::Type::HIDL, 5, 0),
+ };
+ 
+ static const std::map<AudioHalVersionInfo::Type, InterfaceName> sDevicesHALInterfaces = {
+diff --git a/frameworks/av/media/libaudiohal/impl/Android.bp b/frameworks/av/media/libaudiohal/impl/Android.bp
+index 00f3929bffaf219b5ac938b69b7b33181313cd6a..35854022022153e233c45f97232834697a362f70 100644
+--- a/frameworks/av/media/libaudiohal/impl/Android.bp
++++ b/frameworks/av/media/libaudiohal/impl/Android.bp
+@@ -82,6 +82,32 @@ cc_defaults {
+     ],
+ }
+ 
++cc_library_shared {
++    name: "libaudiohal@5.0",
++    defaults: [
++        "libaudiohal_default",
++        "libaudiohal_hidl_default",
++    ],
++    srcs: [
++        ":audio_core_hal_client_sources",
++        ":audio_effect_hidl_hal_client_sources",
++        "EffectsFactoryHalEntry.cpp",
++    ],
++    shared_libs: [
++        "android.hardware.audio.common@5.0",
++        "android.hardware.audio.common@5.0-util",
++        "android.hardware.audio.effect@5.0",
++        "android.hardware.audio.effect@5.0-util",
++        "android.hardware.audio@5.0",
++        "android.hardware.audio@5.0-util",
++    ],
++    cflags: [
++        "-DMAJOR_VERSION=5",
++        "-DMINOR_VERSION=0",
++        "-include common/all-versions/VersionMacro.h",
++    ],
++}
++
+ cc_library_shared {
+     name: "libaudiohal@6.0",
+     defaults: [
+diff --git a/frameworks/av/services/audiopolicy/common/managerdefinitions/src/AudioPolicyConfig.cpp b/frameworks/av/services/audiopolicy/common/managerdefinitions/src/AudioPolicyConfig.cpp
+index 10973417e84083039a86fbf24b40f254b4e00799..e924c1866c8664fd457b1d054eac86ced294a439 100644
+--- a/frameworks/av/services/audiopolicy/common/managerdefinitions/src/AudioPolicyConfig.cpp
++++ b/frameworks/av/services/audiopolicy/common/managerdefinitions/src/AudioPolicyConfig.cpp
+@@ -17,6 +17,8 @@
+ #define LOG_TAG "APM_Config"
+ 
+ #include <android-base/properties.h>
++#include <cerrno>
++#include <sys/stat.h>
+ #include <AudioPolicyConfig.h>
+ #include <IOProfile.h>
+ #include <Serializer.h>
+@@ -38,6 +40,48 @@ using media::audio::common::AudioPortExt;
+ 
+ namespace {
+ 
++// Temporary whyred diagnosis: observe policy discovery without changing its
++// ordering, readability decisions, XML contents, or fallback behavior.
++void logWhyredPolicyDiscovery(const std::string& selectedPath) {
++    const int savedErrno = errno;
++    if (base::GetProperty("ro.product.device", "") != "whyred") {
++        errno = savedErrno;
++        return;
++    }
++    ALOGI("WHYRED_POLICY_DIAG uid=%u euid=%u selected='%s'",
++            static_cast<unsigned>(getuid()), static_cast<unsigned>(geteuid()),
++            selectedPath.c_str());
++    for (const char* key : {"ro.boot.product.vendor.sku", "ro.vendor.qti.va_aosp.support",
++            "ro.bluetooth.a2dp_offload.supported", "persist.bluetooth.a2dp_offload.disabled",
++            "persist.bluetooth.bluetooth_audio_hal.disabled", "ro.bluetooth.leaudio_offload.supported",
++            "persist.bluetooth.leaudio_offload.disabled"}) {
++        char value[PROPERTY_VALUE_MAX] = {};
++        const int length = property_get(key, value, "");
++        ALOGI("WHYRED_POLICY_DIAG property %s='%s' length=%d", key, value, length);
++    }
++    auto paths = audio_get_configuration_paths();
++    // This extra path is a diagnostic probe only: 23.2 searched it when the
++    // Qualcomm va_aosp property was enabled; do not restore it in this test.
++    paths.emplace_back("/vendor/etc/audio");
++    for (const auto& directory : paths) {
++        for (const char* name : {"audio_policy_configuration.xml",
++                "audio_policy_configuration_a2dp_offload_disabled.xml",
++                "audio_policy_configuration_le_offload_disabled.xml",
++                "audio_policy_configuration_bluetooth_legacy_hal.xml"}) {
++            const std::string path = directory + "/" + name;
++            const int accessResult = access(path.c_str(), R_OK);
++            const int accessError = accessResult == 0 ? 0 : errno;
++            struct stat info = {};
++            const int statResult = stat(path.c_str(), &info);
++            const int statError = statResult == 0 ? 0 : errno;
++            ALOGI("WHYRED_POLICY_DIAG probe='%s' access=%d errno=%d stat=%d errno=%d mode=%o",
++                    path.c_str(), accessResult, accessError, statResult, statError,
++                    static_cast<unsigned>(info.st_mode));
++        }
++    }
++    errno = savedErrno;
++}
++
+ ConversionResult<sp<PolicyAudioPort>>
+ aidl2legacy_portId_PolicyAudioPort(int32_t portId,
+         const std::unordered_map<int32_t, sp<PolicyAudioPort>>& ports) {
+@@ -200,10 +244,15 @@ sp<const AudioPolicyConfig> AudioPolicyConfig::loadFromApmXmlConfigWithFallback(
+         const std::string& xmlFilePath) {
+     const std::string filePath =
+             xmlFilePath.empty() ? audio_get_audio_policy_config_file() : xmlFilePath;
++    logWhyredPolicyDiscovery(filePath);
+     auto config = sp<AudioPolicyConfig>::make();
+-    if (status_t status = config->loadFromXml(filePath, false /*forVts*/); status == NO_ERROR) {
++    const status_t status = config->loadFromXml(filePath, false /*forVts*/);
++    if (status == NO_ERROR) {
++        ALOGI("WHYRED_POLICY_DIAG XML loaded path='%s'", filePath.c_str());
+         return config;
+     }
++    ALOGE("WHYRED_POLICY_DIAG XML failed path='%s' status=%d; using default policy",
++            filePath.c_str(), status);
+     return createDefault();
+ }
+ 
+diff --git a/frameworks/base/media/java/android/media/AudioHalVersionInfo.java b/frameworks/base/media/java/android/media/AudioHalVersionInfo.java
+index 3e456a65c2e42a2a5093bcb4b407fa15130b3f9a..2b6f72eabeec31c79826d20335be0f365f8bc193 100644
+--- a/frameworks/base/media/java/android/media/AudioHalVersionInfo.java
++++ b/frameworks/base/media/java/android/media/AudioHalVersionInfo.java
+@@ -84,7 +84,7 @@ public final class AudioHalVersionInfo implements Parcelable, Comparable<AudioHa
+      * there is a change to supported versions.
+      */
+     public static final @NonNull List<AudioHalVersionInfo> VERSIONS =
+-            List.of(AIDL_1_0, HIDL_7_1, HIDL_7_0, HIDL_6_0);
++            List.of(AIDL_1_0, HIDL_7_1, HIDL_7_0, HIDL_6_0, HIDL_5_0);
+ 
+     private static final String TAG = "AudioHalVersionInfo";
+     private AudioHalVersion mHalVersion = new AudioHalVersion();
+diff --git a/frameworks/base/packages/SystemUI/multivalentTests/src/com/android/systemui/qs/tiles/impl/flashlight/domain/interactor/FlashlightTileUserActionInteractorTest.kt b/frameworks/base/packages/SystemUI/multivalentTests/src/com/android/systemui/qs/tiles/impl/flashlight/domain/interactor/FlashlightTileUserActionInteractorTest.kt
+index 275cbe980d3cf8ba5cc06a53b2cf6f927de03fec..46de00abd21e1a10eb059159233795118070d180 100644
+--- a/frameworks/base/packages/SystemUI/multivalentTests/src/com/android/systemui/qs/tiles/impl/flashlight/domain/interactor/FlashlightTileUserActionInteractorTest.kt
++++ b/frameworks/base/packages/SystemUI/multivalentTests/src/com/android/systemui/qs/tiles/impl/flashlight/domain/interactor/FlashlightTileUserActionInteractorTest.kt
+@@ -72,7 +72,7 @@ class FlashlightTileUserActionInteractorTest : SysuiTestCase() {
+ 
+     @EnableFlags(com.android.systemui.Flags.FLAG_FLASHLIGHT_STRENGTH)
+     @Test
+-    fun flagOn_handleClickToEnable_whenBinary_doesNothing() =
++    fun flagOn_handleClickToEnable_whenBinary_togglesState() =
+         kosmos.runTest {
+             assumeFalse(ActivityManager.isUserAMonkey())
+             val state by collectLastValue(flashlightInteractor.state)
+@@ -88,7 +88,7 @@ class FlashlightTileUserActionInteractorTest : SysuiTestCase() {
+ 
+             underTest.handleInput(click(FlashlightModel.Available.Binary(false)))
+ 
+-            assertThat(state).isEqualTo(FlashlightModel.Available.Binary(false))
++            assertThat(state).isEqualTo(FlashlightModel.Available.Binary(true))
+             verify(mockFlashlightDialogDelegate, never()).showDialog()
+         }
+ 
+@@ -130,7 +130,7 @@ class FlashlightTileUserActionInteractorTest : SysuiTestCase() {
+ 
+     @EnableFlags(com.android.systemui.Flags.FLAG_FLASHLIGHT_STRENGTH)
+     @Test
+-    fun flagOn_handleClickWhenEnabled_whenBinary_doesNothing() =
++    fun flagOn_handleClickWhenEnabled_whenBinary_togglesState() =
+         kosmos.runTest {
+             assumeFalse(ActivityManager.isUserAMonkey())
+             val state by collectLastValue(flashlightInteractor.state)
+@@ -150,7 +150,7 @@ class FlashlightTileUserActionInteractorTest : SysuiTestCase() {
+             // at this point the stage is set for the actual test
+             underTest.handleInput(click(enabledBinaryFlashlight))
+ 
+-            assertThat(state).isEqualTo(enabledBinaryFlashlight)
++            assertThat(state).isEqualTo(FlashlightModel.Available.Binary(false))
+             verify(mockFlashlightDialogDelegate, never()).showDialog()
+         }
+ 
+diff --git a/frameworks/base/packages/SystemUI/res/values/config.xml b/frameworks/base/packages/SystemUI/res/values/config.xml
+index 140bb805af522ea0a29cbc1ff4e754227d67f5fc..5bc063e3c16e175a1fe78e6fc8c6d9ba030f7335 100644
+--- a/frameworks/base/packages/SystemUI/res/values/config.xml
++++ b/frameworks/base/packages/SystemUI/res/values/config.xml
+@@ -52,6 +52,9 @@
+ 
+     <bool name="config_dead_zone_flash">false</bool>
+ 
++    <!-- Optional rear camera ID preferred for flashlight control. -->
++    <string name="config_flashlight_camera_id" translatable="false"></string>
++
+     <!-- Whether to enable dimming navigation buttons when wallpaper is not visible, should be
+          enabled for OLED devices to reduce/prevent burn in on the navigation bar (because of the
+          black background and static button placements) and disabled for all other devices to
+diff --git a/frameworks/base/packages/SystemUI/src/com/android/systemui/flashlight/data/repository/FlashlightRepository.kt b/frameworks/base/packages/SystemUI/src/com/android/systemui/flashlight/data/repository/FlashlightRepository.kt
+index 14065ee43aeb3f1eca4525245e7dfb3af3180cd5..1027e5e6d5f3997e3f196fe73b949a566ad8ce4d 100644
+--- a/frameworks/base/packages/SystemUI/src/com/android/systemui/flashlight/data/repository/FlashlightRepository.kt
++++ b/frameworks/base/packages/SystemUI/src/com/android/systemui/flashlight/data/repository/FlashlightRepository.kt
+@@ -17,6 +17,7 @@
+ package com.android.systemui.flashlight.data.repository
+ 
+ import android.content.pm.PackageManager
++import android.content.res.Resources
+ import android.hardware.camera2.CameraAccessException
+ import android.hardware.camera2.CameraCharacteristics
+ import android.hardware.camera2.CameraManager
+@@ -25,10 +26,12 @@ import android.provider.Settings
+ import com.android.systemui.CoreStartable
+ import com.android.systemui.dagger.SysUISingleton
+ import com.android.systemui.dagger.qualifiers.Background
++import com.android.systemui.dagger.qualifiers.Main
+ import com.android.systemui.dump.DumpManager
+ import com.android.systemui.flashlight.flags.FlashlightStrength
+ import com.android.systemui.flashlight.shared.logger.FlashlightLogger
+ import com.android.systemui.flashlight.shared.model.FlashlightModel
++import com.android.systemui.res.R
+ import com.android.systemui.shared.settings.data.repository.SecureSettingsRepository
+ import com.android.systemui.user.data.repository.UserRepository
+ import com.android.systemui.util.asIndenting
+@@ -89,6 +92,7 @@ constructor(
+     private val cameraManager: CameraManager,
+     private val dumpManager: DumpManager,
+     private val packageManager: PackageManager,
++    @Main private val resources: Resources,
+     private val logger: FlashlightLogger,
+     private val userRepo: UserRepository,
+ ) : FlashlightRepository, CoreStartable {
+@@ -221,8 +225,10 @@ constructor(
+ 
+         // Prefer logical multi-camera with flash — the HAL routes torch through these
+         // on devices where multiple cameras share a single flash unit.
++        val preferredId = resources.getString(R.string.config_flashlight_camera_id)
+         val selectedId =
+-            ids.firstOrNull { isBackFlashCamera(it) && isLogicalCamera(it) }
++            preferredId.takeIf { it.isNotBlank() && it in ids && isBackFlashCamera(it) }
++                ?: ids.firstOrNull { isBackFlashCamera(it) && isLogicalCamera(it) }
+                 ?: ids.firstOrNull { isBackFlashCamera(it) }
+ 
+         if (selectedId != null) {
+diff --git a/frameworks/base/packages/SystemUI/src/com/android/systemui/statusbar/policy/FlashlightControllerImpl.java b/frameworks/base/packages/SystemUI/src/com/android/systemui/statusbar/policy/FlashlightControllerImpl.java
+index c290861e161b72490dc75079b3621c3d15902865..1af26d559c70ddddbc19e38f60ee0eb150e56df8 100644
+--- a/frameworks/base/packages/SystemUI/src/com/android/systemui/statusbar/policy/FlashlightControllerImpl.java
++++ b/frameworks/base/packages/SystemUI/src/com/android/systemui/statusbar/policy/FlashlightControllerImpl.java
+@@ -18,6 +18,7 @@ package com.android.systemui.statusbar.policy;
+ 
+ import android.annotation.WorkerThread;
+ import android.content.pm.PackageManager;
++import android.content.res.Resources;
+ import android.hardware.camera2.CameraAccessException;
+ import android.hardware.camera2.CameraCharacteristics;
+ import android.hardware.camera2.CameraManager;
+@@ -32,7 +33,9 @@ import com.android.internal.annotations.GuardedBy;
+ import com.android.systemui.broadcast.BroadcastSender;
+ import com.android.systemui.dagger.SysUISingleton;
+ import com.android.systemui.dagger.qualifiers.Background;
++import com.android.systemui.dagger.qualifiers.Main;
+ import com.android.systemui.dump.DumpManager;
++import com.android.systemui.res.R;
+ import com.android.systemui.util.settings.SecureSettings;
+ 
+ import java.io.PrintWriter;
+@@ -66,6 +69,7 @@ public class FlashlightControllerImpl implements FlashlightController {
+     private final SecureSettings mSecureSettings;
+     private final DumpManager mDumpManager;
+     private final BroadcastSender mBroadcastSender;
++    private final Resources mResources;
+ 
+     private final boolean mHasFlashlight;
+ 
+@@ -87,7 +91,8 @@ public class FlashlightControllerImpl implements FlashlightController {
+             @Background Executor bgExecutor,
+             SecureSettings secureSettings,
+             BroadcastSender broadcastSender,
+-            PackageManager packageManager
++            PackageManager packageManager,
++            @Main Resources resources
+     ) {
+         mCameraManager = cameraManager;
+         mExecutor = bgExecutor;
+@@ -95,6 +100,7 @@ public class FlashlightControllerImpl implements FlashlightController {
+         mSecureSettings = secureSettings;
+         mDumpManager = dumpManager;
+         mBroadcastSender = broadcastSender;
++        mResources = resources;
+ 
+         mHasFlashlight = packageManager.hasSystemFeature(PackageManager.FEATURE_CAMERA_FLASH);
+         init();
+@@ -185,6 +191,21 @@ public class FlashlightControllerImpl implements FlashlightController {
+     private String getCameraId() throws CameraAccessException {
+         String[] ids = mCameraManager.getCameraIdList();
+ 
++        String configuredId = mResources.getString(R.string.config_flashlight_camera_id);
++        if (!TextUtils.isEmpty(configuredId)) {
++            for (String id : ids) {
++                if (!configuredId.equals(id)) continue;
++                CameraCharacteristics c = mCameraManager.getCameraCharacteristics(id);
++                if (Boolean.TRUE.equals(c.get(CameraCharacteristics.FLASH_INFO_AVAILABLE))
++                        && Integer.valueOf(CameraCharacteristics.LENS_FACING_BACK).equals(
++                                c.get(CameraCharacteristics.LENS_FACING))) {
++                    return id;
++                }
++                Log.w(TAG, "Configured flashlight camera is not a rear flash camera: " + id);
++                break;
++            }
++        }
++
+         // First pass: prefer logical multi-camera with flash — the HAL routes torch
+         // through these on devices where multiple cameras share a single flash unit.
+         for (String id : ids) {
+diff --git a/frameworks/base/packages/SystemUI/tests/src/com/android/systemui/statusbar/policy/FlashlightControllerImplTest.kt b/frameworks/base/packages/SystemUI/tests/src/com/android/systemui/statusbar/policy/FlashlightControllerImplTest.kt
+index 902caf3ff651f136e7690689d5a5558fff33fbe8..fc3a552d98ff506f326c2c77c09f4aa555d04521 100644
+--- a/frameworks/base/packages/SystemUI/tests/src/com/android/systemui/statusbar/policy/FlashlightControllerImplTest.kt
++++ b/frameworks/base/packages/SystemUI/tests/src/com/android/systemui/statusbar/policy/FlashlightControllerImplTest.kt
+@@ -17,6 +17,7 @@
+ package com.android.systemui.statusbar.policy
+ 
+ import android.content.pm.PackageManager
++import android.content.res.Resources
+ import android.hardware.camera2.CameraCharacteristics
+ import android.hardware.camera2.CameraManager
+ import android.hardware.camera2.impl.CameraMetadataNative
+@@ -25,6 +26,7 @@ import androidx.test.filters.SmallTest
+ import com.android.systemui.SysuiTestCase
+ import com.android.systemui.broadcast.BroadcastSender
+ import com.android.systemui.dump.DumpManager
++import com.android.systemui.res.R
+ import com.android.systemui.util.concurrency.FakeExecutor
+ import com.android.systemui.util.mockito.argumentCaptor
+ import com.android.systemui.util.mockito.capture
+@@ -60,6 +62,9 @@ class FlashlightControllerImplTest : SysuiTestCase() {
+     @Mock
+     private lateinit var packageManager: PackageManager
+ 
++    @Mock
++    private lateinit var resources: Resources
++
+     private lateinit var fakeSettings: FakeSettings
+     private lateinit var fakeSystemClock: FakeSystemClock
+     private lateinit var backgroundExecutor: FakeExecutor
+@@ -75,6 +80,7 @@ class FlashlightControllerImplTest : SysuiTestCase() {
+ 
+         `when`(packageManager.hasSystemFeature(PackageManager.FEATURE_CAMERA_FLASH))
+                 .thenReturn(true)
++        `when`(resources.getString(R.string.config_flashlight_camera_id)).thenReturn("")
+ 
+         controller = FlashlightControllerImpl(
+                 dumpManager,
+@@ -82,7 +88,8 @@ class FlashlightControllerImplTest : SysuiTestCase() {
+                 backgroundExecutor,
+                 fakeSettings,
+                 broadcastSender,
+-                packageManager
++                packageManager,
++                resources
+         )
+     }
+ 
+@@ -129,6 +136,30 @@ class FlashlightControllerImplTest : SysuiTestCase() {
+         verify(cameraManager).setTorchMode(id, enable)
+     }
+ 
++    @Test
++    fun testConfiguredCameraIsPreferred() {
++        val configuredId = "3"
++        val fallbackId = "0"
++        val configuredCamera = CameraCharacteristics(CameraMetadataNative().apply {
++            set(CameraCharacteristics.FLASH_INFO_AVAILABLE, true)
++            set(CameraCharacteristics.LENS_FACING, CameraCharacteristics.LENS_FACING_BACK)
++        })
++        val fallbackCamera = CameraCharacteristics(CameraMetadataNative().apply {
++            set(CameraCharacteristics.FLASH_INFO_AVAILABLE, true)
++            set(CameraCharacteristics.LENS_FACING, CameraCharacteristics.LENS_FACING_BACK)
++        })
++        `when`(resources.getString(R.string.config_flashlight_camera_id)).thenReturn(configuredId)
++        `when`(cameraManager.cameraIdList).thenReturn(arrayOf(fallbackId, configuredId))
++        `when`(cameraManager.getCameraCharacteristics(configuredId)).thenReturn(configuredCamera)
++        `when`(cameraManager.getCameraCharacteristics(fallbackId)).thenReturn(fallbackCamera)
++
++        backgroundExecutor.runAllReady()
++
++        verify(cameraManager).registerTorchCallback(eq(backgroundExecutor), any())
++        verify(cameraManager).getCameraCharacteristics(configuredId)
++        verify(cameraManager, never()).getCameraCharacteristics(fallbackId)
++    }
++
+     @Test
+     fun testCallbackRemovedWhileDispatching_doesntCrash() {
+         injectCamera()
+diff --git a/frameworks/base/packages/SystemUI/tests/utils/src/com/android/systemui/flashlight/data/repository/FlashlightRepositoryKosmos.kt b/frameworks/base/packages/SystemUI/tests/utils/src/com/android/systemui/flashlight/data/repository/FlashlightRepositoryKosmos.kt
+index 16db0248b8b2df233d7d2e71558b51c8735d0fde..d90170640091e84e4929bc342c50647e29aa0dec 100644
+--- a/frameworks/base/packages/SystemUI/tests/utils/src/com/android/systemui/flashlight/data/repository/FlashlightRepositoryKosmos.kt
++++ b/frameworks/base/packages/SystemUI/tests/utils/src/com/android/systemui/flashlight/data/repository/FlashlightRepositoryKosmos.kt
+@@ -18,6 +18,7 @@ package com.android.systemui.flashlight.data.repository
+ 
+ import android.content.packageManager
+ import android.content.pm.PackageManager
++import android.content.res.mainResources
+ import com.android.systemui.camera.cameraManager
+ import com.android.systemui.dump.dumpManager
+ import com.android.systemui.flashlight.shared.logger.flashlightLogger
+@@ -38,6 +39,7 @@ val Kosmos.flashlightRepository: FlashlightRepositoryImpl by
+             cameraManager,
+             dumpManager,
+             packageManager,
++            mainResources,
+             flashlightLogger,
+             userRepository,
+         )
+diff --git a/frameworks/base/services/core/java/com/android/server/am/ProcessList.java b/frameworks/base/services/core/java/com/android/server/am/ProcessList.java
+index d8e2cfaae0671d20740f11da8698eace47e925d4..4babb3c022eaba4aa0a4101709cb2df19dd56ced 100644
+--- a/frameworks/base/services/core/java/com/android/server/am/ProcessList.java
++++ b/frameworks/base/services/core/java/com/android/server/am/ProcessList.java
+@@ -3608,6 +3608,16 @@ public final class ProcessList extends ProcessListInternal
+             // is required by the system server to prevent it being killed.
+             mService.mProcessStateController.setMaxAdj(r, PERSISTENT_SERVICE_ADJ);
+         }
++        // Keep Android Auto's car connection processes out of cached-app reclaim.
++        // Set the framework-owned ceiling so OOM updates and process restarts
++        // preserve protection from the kernel's Simple LMK (which skips negative adj).
++        if (!isolated && !isSdkSandbox
++                && "com.google.android.projection.gearhead".equals(info.packageName)
++                && ("com.google.android.projection.gearhead:car".equals(proc)
++                        || "com.google.android.projection.gearhead:shared".equals(proc)
++                        || "com.google.android.projection.gearhead:provider".equals(proc))) {
++            mService.mProcessStateController.setMaxAdj(r, PERSISTENT_SERVICE_ADJ);
++        }
+         addProcessNameLocked(r);
+         return r;
+     }
+diff --git a/frameworks/base/services/core/java/com/android/server/notification/NotificationAttentionHelper.java b/frameworks/base/services/core/java/com/android/server/notification/NotificationAttentionHelper.java
+index f5756a2d8706b302e3c102b96cdded36161394f1..410d2ec60f54d1d4721cdd42402731715be0f2b2 100644
+--- a/frameworks/base/services/core/java/com/android/server/notification/NotificationAttentionHelper.java
++++ b/frameworks/base/services/core/java/com/android/server/notification/NotificationAttentionHelper.java
+@@ -1075,6 +1075,12 @@ public final class NotificationAttentionHelper {
+     }
+ 
+     void updateLightsLocked() {
++        // LineageNotificationLights loads its settings synchronously in its
++        // constructor and invokes our updater before this field is assigned.
++        if (mLineageNotificationLights == null) {
++            return;
++        }
++
+         // handle notification lights
+         NotificationRecord ledNotification = null;
+         while (ledNotification == null && !mLights.isEmpty()) {
+diff --git a/frameworks/base/services/core/java/com/android/server/stats/pull/StatsPullAtomService.java b/frameworks/base/services/core/java/com/android/server/stats/pull/StatsPullAtomService.java
+index 22d3b9047b164c0be2acbb93132bbd37e365bf7a..9438a1d668964dad27c217b52f26da44d0dff8cc 100644
+--- a/frameworks/base/services/core/java/com/android/server/stats/pull/StatsPullAtomService.java
++++ b/frameworks/base/services/core/java/com/android/server/stats/pull/StatsPullAtomService.java
+@@ -299,6 +299,10 @@ import java.util.function.Function;
+  * @hide
+  */
+ public class StatsPullAtomService extends SystemService {
++    // Whyred's 4.19 kernel lacks compatible GPU and per-process dma-buf metrics.
++    private static final boolean DISABLE_LEGACY_MEMORY_STATS =
++            "whyred".equals(SystemProperties.get("ro.product.device"));
++
+     private static final String TAG = "StatsPullAtomService";
+     private static final boolean DEBUG = false;
+ 
+@@ -2701,11 +2705,14 @@ public class StatsPullAtomService extends SystemService {
+         List<ProcessMemoryState> managedProcessList =
+                 LocalServices.getService(ActivityManagerInternal.class)
+                         .getMemoryStateForProcesses();
+-        KernelAllocationStats.ProcessGpuMem[] gpuAllocations =
+-                KernelAllocationStats.getGpuAllocations();
+-        SparseIntArray gpuMemPerPid = new SparseIntArray(gpuAllocations.length);
+-        for (KernelAllocationStats.ProcessGpuMem processGpuMem : gpuAllocations) {
+-            gpuMemPerPid.put(processGpuMem.pid, processGpuMem.gpuMemoryKb);
++        SparseIntArray gpuMemPerPid = new SparseIntArray();
++        if (!DISABLE_LEGACY_MEMORY_STATS) {
++            KernelAllocationStats.ProcessGpuMem[] gpuAllocations =
++                    KernelAllocationStats.getGpuAllocations();
++            gpuMemPerPid = new SparseIntArray(gpuAllocations.length);
++            for (KernelAllocationStats.ProcessGpuMem processGpuMem : gpuAllocations) {
++                gpuMemPerPid.put(processGpuMem.pid, processGpuMem.gpuMemoryKb);
++            }
+         }
+         for (ProcessMemoryState managedProcess : managedProcessList) {
+             final MemorySnapshot snapshot = readMemorySnapshotFromProcfs(managedProcess.pid);
+@@ -2768,6 +2775,7 @@ public class StatsPullAtomService extends SystemService {
+     }
+ 
+     private void registerProcessDmabufMemory() {
++        if (DISABLE_LEGACY_MEMORY_STATS) return;
+         int tagId = FrameworkStatsLog.PROCESS_DMABUF_MEMORY;
+         mStatsManager.setPullAtomCallback(
+                 tagId,
+@@ -2778,6 +2786,7 @@ public class StatsPullAtomService extends SystemService {
+     }
+ 
+     int pullProcessDmabufMemory(int atomTag, List<StatsEvent> pulledData) {
++        if (DISABLE_LEGACY_MEMORY_STATS) return StatsManager.PULL_SKIP;
+         KernelAllocationStats.ProcessDmabuf[] procBufs =
+                 KernelAllocationStats.getDmabufAllocations();
+ 
+diff --git a/frameworks/base/services/tests/uiservicestests/src/com/android/server/notification/NotificationAttentionHelperTest.java b/frameworks/base/services/tests/uiservicestests/src/com/android/server/notification/NotificationAttentionHelperTest.java
+index 34fedd9b10ba395bd94b22c096a43a089d34436a..4535312bba8ead0052b0467395abde29848fc241 100644
+--- a/frameworks/base/services/tests/uiservicestests/src/com/android/server/notification/NotificationAttentionHelperTest.java
++++ b/frameworks/base/services/tests/uiservicestests/src/com/android/server/notification/NotificationAttentionHelperTest.java
+@@ -267,6 +267,18 @@ public class NotificationAttentionHelperTest extends UiServiceTestCase {
+         mChannel = new NotificationChannel("test", "test", IMPORTANCE_HIGH);
+     }
+ 
++    @Test
++    @EnableFlags(Flags.FLAG_FAVORITES_INCOMING_CALL_LIGHTS)
++    public void testConstructor_initialLightSettingsCallbackDoesNotCrash() {
++        // Loading Lineage LED settings invokes updateLightsLocked before the
++        // LineageNotificationLights constructor returns. The call-light path
++        // must not dereference the still-unassigned settings helper.
++        initAttentionHelper(mTestFlagResolver);
++        mAttentionHelper.updateLightsLocked();
++        verify(mPriorityNotificationLight, never())
++                .setFlashing(anyInt(), anyInt(), anyInt(), anyInt());
++    }
++
+     private void initAttentionHelper(TestableFlagResolver flagResolver) {
+         LightsManager lightsManager = mock(LightsManager.class);
+         when(lightsManager.getLight(eq(LightsManager.LIGHT_ID_NOTIFICATIONS))).thenReturn(mLight);
+diff --git a/frameworks/native/services/sensorservice/SensorService.cpp b/frameworks/native/services/sensorservice/SensorService.cpp
+index 912d5cb1dc0164faf9d7ff319a3a4be26af64828..e7ebd78ea2ca6e34928bd94482251649e1b002b3 100644
+--- a/frameworks/native/services/sensorservice/SensorService.cpp
++++ b/frameworks/native/services/sensorservice/SensorService.cpp
+@@ -2007,7 +2007,9 @@ status_t SensorService::registerClientListener(
+     }
+ 
+     status_t frozenErr = binder->addFrozenStateChangeCallback(recipient);
+-    if (frozenErr != OK) {
++    // Older Binder drivers do not support freeze notifications. Keep death
++    // tracking and normal sensor delivery rather than rejecting the client.
++    if (frozenErr != OK && frozenErr != INVALID_OPERATION) {
+         ALOGE("Failed to addFrozenStateChangeCallback (pid=%d, uid=%d), error=%d. "
+               "Cleaning up linkToDeath and aborting registration.",
+               pid, uid, frozenErr);
+@@ -2053,7 +2055,8 @@ status_t SensorService::unregisterClientListener(
+         // Detach from binder notifications. Do this without holding mStateLock to prevent ANR.
+         binder->unlinkToDeath(recipient);
+         status_t removeErr = binder->removeFrozenStateChangeCallback(recipient);
+-        if (removeErr != OK && removeErr != DEAD_OBJECT) {
++        // INVALID_OPERATION is expected when freeze notifications are unsupported.
++        if (removeErr != OK && removeErr != DEAD_OBJECT && removeErr != INVALID_OPERATION) {
+             // DEAD_OBJECT is expected if the client is already gone.
+             ALOGW("Failed to remove frozen state change callback, error=%d", removeErr);
+         }
+diff --git a/frameworks/opt/telephony/src/java/com/android/internal/telephony/data/DataServiceManager.java b/frameworks/opt/telephony/src/java/com/android/internal/telephony/data/DataServiceManager.java
+index 98857b386db09a7fec45ebf72fe3e1380c27821a..15135fef82d162f226a419958a2d7b952e506baf 100644
+--- a/frameworks/opt/telephony/src/java/com/android/internal/telephony/data/DataServiceManager.java
++++ b/frameworks/opt/telephony/src/java/com/android/internal/telephony/data/DataServiceManager.java
+@@ -234,11 +234,12 @@ public class DataServiceManager extends Handler {
+         }
+     }
+ 
+-    private final class DataServiceCallbackWrapper extends IDataServiceCallback.Stub {
++    // Legacy Qualcomm telephony extensions subclass this callback.
++    protected class DataServiceCallbackWrapper extends IDataServiceCallback.Stub {
+ 
+         private final String mTag;
+ 
+-        DataServiceCallbackWrapper(String tag) {
++        protected DataServiceCallbackWrapper(String tag) {
+             mTag = tag;
+         }
+ 
+diff --git a/hardware/qcom-caf/sdm660/audio/hal/audio_hw.h b/hardware/qcom-caf/sdm660/audio/hal/audio_hw.h
+index a93c949f1c926c20ce81a71ec5649d5b3b43e215..3519ed72ce0fedf090cb32e98711fd4b63bc6470 100755
+--- a/hardware/qcom-caf/sdm660/audio/hal/audio_hw.h
++++ b/hardware/qcom-caf/sdm660/audio/hal/audio_hw.h
+@@ -289,7 +289,7 @@ enum {
+     AUDIO_USECASE_MAX
+ };
+ 
+-const char * const use_case_table[AUDIO_USECASE_MAX];
++extern const char * const use_case_table[AUDIO_USECASE_MAX];
+ 
+ #define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
+ 
+diff --git a/hardware/qcom-caf/sdm660/audio/hal/msm8974/platform.c b/hardware/qcom-caf/sdm660/audio/hal/msm8974/platform.c
+index 1b7a81a49d8a82fc46baca971f6894f987bbb070..5a3654c4883cf9210092d0cb57ada081c4640c41 100755
+--- a/hardware/qcom-caf/sdm660/audio/hal/msm8974/platform.c
++++ b/hardware/qcom-caf/sdm660/audio/hal/msm8974/platform.c
+@@ -248,7 +248,7 @@ enum {
+ };
+ 
+ #define PLATFORM_CONFIG_KEY_OPERATOR_INFO "operator_info"
+-char vendor_config_path[VENDOR_CONFIG_PATH_MAX_LENGTH];
++static char vendor_config_path[VENDOR_CONFIG_PATH_MAX_LENGTH];
+ char xml_file_path[VENDOR_CONFIG_FILE_MAX_LENGTH];
+ 
+ struct operator_info {
+diff --git a/hardware/qcom-caf/sdm660/audio/hal/platform_info.c b/hardware/qcom-caf/sdm660/audio/hal/platform_info.c
+index b9b69e3bde4a3ba96321281a6adecd3e1a4fc915..a9496dad6449dc461211f81120e58ac5f1ba1258 100755
+--- a/hardware/qcom-caf/sdm660/audio/hal/platform_info.c
++++ b/hardware/qcom-caf/sdm660/audio/hal/platform_info.c
+@@ -54,7 +54,7 @@
+ #endif
+ 
+ #define BUF_SIZE                    1024
+-char vendor_config_path[VENDOR_CONFIG_PATH_MAX_LENGTH];
++static char vendor_config_path[VENDOR_CONFIG_PATH_MAX_LENGTH];
+ char platform_info_xml_path_file[VENDOR_CONFIG_FILE_MAX_LENGTH];
+ 
+ typedef enum {
+diff --git a/hardware/qcom-caf/sdm660/media/mm-video-v4l2/vidc/vdec/Android.bp b/hardware/qcom-caf/sdm660/media/mm-video-v4l2/vidc/vdec/Android.bp
+index f14875ba6680acc7c6edae0b64d71f297967d65c..898af9047537ac5227d1f4ca8c30f7cf0c2a9562 100644
+--- a/hardware/qcom-caf/sdm660/media/mm-video-v4l2/vidc/vdec/Android.bp
++++ b/hardware/qcom-caf/sdm660/media/mm-video-v4l2/vidc/vdec/Android.bp
+@@ -58,7 +58,7 @@ cc_library_shared {
+         "libcutils",
+         "libion",
+         "liblog",
+-        "libqdMetaData",
++        "libqdMetaData_legacy",
+         "libqdutils",
+     ],
+ 
+diff --git a/hardware/qcom-caf/sdm660/media/mm-video-v4l2/vidc/venc/Android.bp b/hardware/qcom-caf/sdm660/media/mm-video-v4l2/vidc/venc/Android.bp
+index 21af9494e0494fd2a3eb317fd94d37199f99765d..0423496a92fb8db8eb30705ff70b1d784a5de5d1 100644
+--- a/hardware/qcom-caf/sdm660/media/mm-video-v4l2/vidc/venc/Android.bp
++++ b/hardware/qcom-caf/sdm660/media/mm-video-v4l2/vidc/venc/Android.bp
+@@ -56,7 +56,7 @@ cc_library_shared {
+         "libcutils",
+         "libion",
+         "liblog",
+-        "libqdMetaData",
++        "libqdMetaData_legacy",
+     ],
+ 
+     static_libs: [
+diff --git a/hardware/qcom-caf/thermal-legacy-um/thermalUtils.cpp b/hardware/qcom-caf/thermal-legacy-um/thermalUtils.cpp
+index fee89727a6134e2e3c2ed6296e4cb81803ede7fc..1c4851b2f08b87182857a644bb5a142fcc494697 100644
+--- a/hardware/qcom-caf/thermal-legacy-um/thermalUtils.cpp
++++ b/hardware/qcom-caf/thermal-legacy-um/thermalUtils.cpp
+@@ -38,6 +38,7 @@ SPDX-License-Identifier: BSD-3-Clause-Clear */
+ #include <android-base/properties.h>
+ #include <android-base/stringprintf.h>
+ #include <android-base/strings.h>
++#include <chrono>
+ 
+ #include "thermalConfig.h"
+ #include "thermalUtils.h"
+@@ -53,7 +54,8 @@ ThermalUtils::ThermalUtils(const ueventCB &inp_cb):
+ 	monitor(std::bind(&ThermalUtils::ueventParse, this,
+ 				std::placeholders::_1,
+ 				std::placeholders::_2)),
+-	cb(inp_cb)
++	cb(inp_cb),
++	poll_shutdown(false)
+ {
+ 	int ret = 0;
+ 	std::vector<struct therm_sensor> sensorList;
+@@ -64,13 +66,15 @@ ThermalUtils::ThermalUtils(const ueventCB &inp_cb):
+ 	if (ret > 0) {
+ 		sensorList = cmnInst.fetch_sensor_list();
+ 		std::lock_guard<std::mutex> _lock(sens_cb_mutex);
+-		for (struct therm_sensor sens: sensorList) {
+-			thermalConfig[sens.sensor_name] = sens;
++		for (const struct therm_sensor& sensor: sensorList) {
++			auto it = thermalConfig.emplace(sensor.sensor_name, sensor).first;
++			struct therm_sensor& sens = it->second;
+ 			cmnInst.read_temperature(sens);
+ 			cmnInst.estimateSeverity(sens);
+ 			cmnInst.initThreshold(sens);
+ 		}
+ 		monitor.start();
++		poll_thread = std::thread(&ThermalUtils::pollTemperatures, this);
+ 	}
+ 	ret = cmnInst.initCdev();
+ 	if (ret > 0) {
+@@ -79,6 +83,31 @@ ThermalUtils::ThermalUtils(const ueventCB &inp_cb):
+ 	}
+ }
+ 
++ThermalUtils::~ThermalUtils()
++{
++	poll_shutdown.store(true);
++	poll_cv.notify_one();
++	if (poll_thread.joinable())
++		poll_thread.join();
++}
++
++void ThermalUtils::pollTemperatures()
++{
++	constexpr auto kPollInterval = std::chrono::seconds(2);
++	std::unique_lock<std::mutex> lock(poll_mutex);
++
++	while (!poll_shutdown.load()) {
++		if (poll_cv.wait_for(lock, kPollInterval,
++				[this] { return poll_shutdown.load(); }))
++			break;
++
++		lock.unlock();
++		std::vector<Temperature> temperatures;
++		readTemperatures(temperatures);
++		lock.lock();
++	}
++}
++
+ bool ThermalUtils::isSensorInitialized()
+ {
+ 	std::lock_guard<std::mutex> _lock(sens_cb_mutex);
+diff --git a/hardware/qcom-caf/thermal-legacy-um/thermalUtils.h b/hardware/qcom-caf/thermal-legacy-um/thermalUtils.h
+index ca07cfa75bae07fb8d14ae070bf47fa0aced8b29..feb1cd8dbd45eed9d077dc0bc4c556206c24f6e3 100644
+--- a/hardware/qcom-caf/thermal-legacy-um/thermalUtils.h
++++ b/hardware/qcom-caf/thermal-legacy-um/thermalUtils.h
+@@ -36,8 +36,11 @@ SPDX-License-Identifier: BSD-3-Clause-Clear */
+ #ifndef THERMAL_THERMAL_UTILS_H__
+ #define THERMAL_THERMAL_UTILS_H__
+ 
+-#include <unordered_map>
++#include <atomic>
++#include <condition_variable>
+ #include <mutex>
++#include <thread>
++#include <unordered_map>
+ #include <aidl/android/hardware/thermal/BnThermal.h>
+ 
+ #include "thermalConfig.h"
+@@ -55,7 +58,7 @@ using ueventCB = std::function<void(Temperature &t)>;
+ class ThermalUtils {
+ 	public:
+ 		ThermalUtils(const ueventCB &inp_cb);
+-		~ThermalUtils() = default;
++		~ThermalUtils();
+ 		bool isCdevInitialized()
+ 		{
+ 			return is_cdev_init;
+@@ -81,9 +84,14 @@ class ThermalUtils {
+ 		std::vector<struct therm_cdev> cdevList;
+ 		std::mutex sens_cb_mutex;
+ 		ueventCB cb;
++		std::atomic<bool> poll_shutdown;
++		std::condition_variable poll_cv;
++		std::mutex poll_mutex;
++		std::thread poll_thread;
+ 
+ 		void ueventParse(std::string sensor_name, int temp);
+ 		void Notify(struct therm_sensor& sens);
++		void pollTemperatures();
+ };
+ 
+ }  // namespace thermal
+diff --git a/hardware/qcom-caf/wlan/qcwcn/wpa_supplicant_8_lib/driver_cmd_nl80211.c b/hardware/qcom-caf/wlan/qcwcn/wpa_supplicant_8_lib/driver_cmd_nl80211.c
+index 6988a9c07423257a2a94fff3fd1a020ac2be57a9..9a5f1a441a5ce4a1b9b4195f154f5452b6ab7916 100644
+--- a/hardware/qcom-caf/wlan/qcwcn/wpa_supplicant_8_lib/driver_cmd_nl80211.c
++++ b/hardware/qcom-caf/wlan/qcwcn/wpa_supplicant_8_lib/driver_cmd_nl80211.c
+@@ -74,6 +74,9 @@
+ #include "driver_cmd_nl80211_mlo.h"
+ #include <inttypes.h>
+ 
++struct wpa_driver_nl80211_data *drv;
++struct i802_bss *bss;
++
+ #define WPA_PS_ENABLED		0
+ #define WPA_PS_DISABLED		1
+ #define UNUSED(x)	(void)(x)
+diff --git a/hardware/qcom-caf/wlan/qcwcn/wpa_supplicant_8_lib/driver_cmd_nl80211_common.h b/hardware/qcom-caf/wlan/qcwcn/wpa_supplicant_8_lib/driver_cmd_nl80211_common.h
+index 0e532127b173c9845e1c1baa9c2363fc2a0a7171..212cc07fce8bbcfb33b999ae517711c562410b01 100644
+--- a/hardware/qcom-caf/wlan/qcwcn/wpa_supplicant_8_lib/driver_cmd_nl80211_common.h
++++ b/hardware/qcom-caf/wlan/qcwcn/wpa_supplicant_8_lib/driver_cmd_nl80211_common.h
+@@ -54,8 +54,8 @@
+ #define MAX_NUM_MLO_LINKS      15
+ #define NL80211_ATTR_MAX_INTERNAL 256
+ 
+-struct wpa_driver_nl80211_data *drv;
+-struct i802_bss *bss;
++extern struct wpa_driver_nl80211_data *drv;
++extern struct i802_bss *bss;
+ struct nl_msg *prepare_nlmsg(struct wpa_driver_nl80211_data *drv,
+ 		             char *ifname, int cmdid, int subcmd, int flag);
+ struct nl_msg *prepare_vendor_nlmsg(struct wpa_driver_nl80211_data *drv,
+diff --git a/hardware/xiaomi/hidl/biometrics/fingerprint/BiometricsFingerprint.h b/hardware/xiaomi/hidl/biometrics/fingerprint/BiometricsFingerprint.h
+index bd822f04f02f6336d40f7ade7bdf6170f0cef92f..05e4633cdaa44f485d71f5db5a69fdb21713521d 100644
+--- a/hardware/xiaomi/hidl/biometrics/fingerprint/BiometricsFingerprint.h
++++ b/hardware/xiaomi/hidl/biometrics/fingerprint/BiometricsFingerprint.h
+@@ -13,6 +13,7 @@
+ #include <hidl/MQDescriptor.h>
+ #include <hidl/Status.h>
+ #include <log/log.h>
++#include <mutex>
+ #include "UdfpsHandler.h"
+ #include "fingerprint.h"
+ 
+diff --git a/packages/apps/Updater/app/src/main/java/org/lineageos/updater/data/source/network/UpdatesNetworkDataSource.kt b/packages/apps/Updater/app/src/main/java/org/lineageos/updater/data/source/network/UpdatesNetworkDataSource.kt
+index 2f1407f73d8fbc8c894aa34130fa2620a5cfdc39..a0776f92f6a3167a352da93fe723e6c28567a433 100644
+--- a/packages/apps/Updater/app/src/main/java/org/lineageos/updater/data/source/network/UpdatesNetworkDataSource.kt
++++ b/packages/apps/Updater/app/src/main/java/org/lineageos/updater/data/source/network/UpdatesNetworkDataSource.kt
+@@ -6,11 +6,19 @@ package org.lineageos.updater.data.source.network
+ 
+ import android.content.Context
+ import kotlinx.serialization.json.Json
++import kotlinx.serialization.json.JsonArray
++import kotlinx.serialization.json.JsonObject
++import kotlinx.serialization.json.JsonPrimitive
++import kotlinx.serialization.json.contentOrNull
+ import okhttp3.OkHttpClient
+ import okhttp3.Request
+ import org.lineageos.updater.R
+ import org.lineageos.updater.deviceinfo.DeviceInfoUtils
+ import java.io.IOException
++import java.time.Instant
++import java.time.LocalDate
++import java.time.ZoneOffset
++import java.time.format.DateTimeFormatter
+ import java.util.concurrent.TimeUnit
+ 
+ class UpdatesNetworkDataSource(private val context: Context) {
+@@ -46,6 +54,94 @@ class UpdatesNetworkDataSource(private val context: Context) {
+             response.body?.string() ?: throw IOException("Empty response body")
+         }
+ 
+-        return Json.decodeFromString<List<NetworkUpdate>>(responseBody)
++        return if (serverUrl.isGithubReleasesApi()) {
++            parseGithubReleases(responseBody)
++        } else {
++            Json.decodeFromString<List<NetworkUpdate>>(responseBody)
++        }
++    }
++
++    private fun parseGithubReleases(responseBody: String): List<NetworkUpdate> {
++        val releases = Json.parseToJsonElement(responseBody) as? JsonArray
++            ?: throw IOException("GitHub releases response is not a JSON array")
++        val device = DeviceInfoUtils.device
++        val buildVersion = DeviceInfoUtils.buildVersion
++        val releaseType = DeviceInfoUtils.releaseType
++        val filenamePrefix = "lineage-$buildVersion-"
++        val deviceMarker = "-$device-"
++        val typeMarker = "-$releaseType-"
++        val sha256Pattern = Regex("[0-9a-fA-F]{64}")
++
++        return buildList {
++            for (releaseElement in releases) {
++                val release = releaseElement as? JsonObject ?: continue
++                if (release.stringValue("draft") == "true") continue
++
++                val timestamp = releaseTimestamp(
++                    release.stringValue("tag_name"),
++                    release.stringValue("published_at"),
++                ) ?: continue
++                val assets = release["assets"] as? JsonArray ?: continue
++
++                for (assetElement in assets) {
++                    val asset = assetElement as? JsonObject ?: continue
++                    val filename = asset.stringValue("name") ?: continue
++                    if (!filename.endsWith(".zip", ignoreCase = true) ||
++                        !filename.startsWith(filenamePrefix, ignoreCase = true) ||
++                        !filename.contains(deviceMarker, ignoreCase = true) ||
++                        !filename.contains(typeMarker, ignoreCase = true)
++                    ) continue
++
++                    val digest = asset.stringValue("digest") ?: continue
++                    if (!digest.startsWith("sha256:", ignoreCase = true)) continue
++                    val sha256 = digest.substringAfter(':').lowercase()
++                    if (!sha256Pattern.matches(sha256)) continue
++
++                    val url = asset.stringValue("browser_download_url") ?: continue
++                    if (!url.startsWith("https://")) continue
++                    val size = asset.stringValue("size")?.toLongOrNull()?.takeIf { it > 0 } ?: continue
++
++                    add(
++                        NetworkUpdate(
++                            datetime = timestamp,
++                            files = listOf(
++                                NetworkUpdateFile(
++                                    filename = filename,
++                                    osSdkLevel = DeviceInfoUtils.sdkLevel,
++                                    sha256 = sha256,
++                                    size = size,
++                                    url = url,
++                                ),
++                            ),
++                            type = releaseType,
++                            version = buildVersion,
++                        ),
++                    )
++                }
++            }
++        }
++    }
++
++    private fun releaseTimestamp(tagName: String?, publishedAt: String?): Long? {
++        // Release tags use the build date; publication time would make an installed ZIP
++        // appear newer than the build itself and cause it to be offered again.
++        val tagDate = tagName?.let { Regex("\\d{8}").find(it)?.value }
++        if (tagDate != null) {
++            runCatching {
++                LocalDate.parse(tagDate, DateTimeFormatter.BASIC_ISO_DATE)
++                    .atStartOfDay(ZoneOffset.UTC)
++                    .toEpochSecond()
++            }.getOrNull()?.let { return it }
++        }
++
++        return publishedAt?.let { runCatching { Instant.parse(it).epochSecond }.getOrNull() }
++    }
++
++    private fun JsonObject.stringValue(name: String): String? =
++        (this[name] as? JsonPrimitive)?.contentOrNull
++
++    private fun String.isGithubReleasesApi(): Boolean {
++        val path = substringBefore('?').removeSuffix("/")
++        return path.startsWith("https://api.github.com/repos/") && path.endsWith("/releases")
+     }
+ }
+diff --git a/packages/modules/ConfigInfrastructure/aconfigd/src/storage_files.rs b/packages/modules/ConfigInfrastructure/aconfigd/src/storage_files.rs
+index 293384f0e5d2a8a7aa5bbb3a98ea8da50811bc2a..47f7caa20ccc7e4b8c022cc665d23b700a7f47ef 100644
+--- a/packages/modules/ConfigInfrastructure/aconfigd/src/storage_files.rs
++++ b/packages/modules/ConfigInfrastructure/aconfigd/src/storage_files.rs
+@@ -789,6 +789,27 @@ impl StorageFiles {
+             return Ok(false);
+         }
+ 
++        // A forced restart can leave a newer, empty or truncated boot copy.
++        // Timestamps alone must not make that copy eligible for reuse: readers
++        // expect a complete storage header and can abort on an empty mapping.
++        for (boot, persist) in [
++            (&self.storage_record.boot_flag_val, &self.storage_record.persist_flag_val),
++            (&self.storage_record.boot_flag_info, &self.storage_record.persist_flag_info),
++        ] {
++            let file_size = |file: &Path| {
++                std::fs::metadata(file).map(|metadata| metadata.len()).map_err(|errmsg| {
++                    AconfigdError::FailToGetFileMetadata {
++                        file: file.display().to_string(),
++                        errmsg,
++                    }
++                })
++            };
++            let boot_size = file_size(boot)?;
++            if boot_size < 4 || boot_size != file_size(persist)? {
++                return Ok(false);
++            }
++        }
++
+         let persist_mtime = *[
+             get_file_mtime(&self.storage_record.persist_flag_val)?,
+             get_file_mtime(&self.storage_record.persist_flag_info)?,
+@@ -1634,6 +1655,41 @@ mod tests {
+         );
+     }
+ 
++    #[test]
++    fn test_regenerate_empty_or_truncated_boot_storage() {
++        for truncate_info in [false, true] {
++            for empty in [false, true] {
++                let container = ContainerMock::new();
++                let root_dir = StorageRootDirMock::new();
++                let mut storage_files = create_mock_storage_files(&container, &root_dir);
++                let record = &storage_files.storage_record;
++                let (boot, persist) = if truncate_info {
++                    (&record.boot_flag_info, &record.persist_flag_info)
++                } else {
++                    (&record.boot_flag_val, &record.persist_flag_val)
++                };
++                let expected = std::fs::read(persist).unwrap();
++                assert!(expected.len() > 4);
++                let truncated_len = if empty { 0 } else { expected.len() - 1 };
++                std::fs::write(boot, &expected[..truncated_len]).unwrap();
++                // Ensure timestamps alone would select the damaged copies.
++                let newer = std::time::SystemTime::now() + std::time::Duration::from_secs(1);
++                for file in [&record.boot_flag_val, &record.boot_flag_info] {
++                    std::fs::File::open(file).unwrap().set_modified(newer).unwrap();
++                }
++                assert!(!storage_files.reuse_boot_storage_files().unwrap());
++                storage_files.apply_all_staged_overrides(false).unwrap();
++                let record = &storage_files.storage_record;
++                for (boot, persist) in [
++                    (&record.boot_flag_val, &record.persist_flag_val),
++                    (&record.boot_flag_info, &record.persist_flag_info),
++                ] {
++                    assert_eq!(std::fs::read(boot).unwrap(), std::fs::read(persist).unwrap());
++                }
++            }
++        }
++    }
++
+     #[test]
+     fn test_get_all_server_overrides() {
+         let container = ContainerMock::new();
+diff --git a/packages/modules/Connectivity/bpf/loader/NetBpfLoad.cpp b/packages/modules/Connectivity/bpf/loader/NetBpfLoad.cpp
+index 7ba3247dcc6f31ab9b612d410202067c821ab58a..f8f91d22f8d98cd0e65969f23eb4196768a1d707 100644
+--- a/packages/modules/Connectivity/bpf/loader/NetBpfLoad.cpp
++++ b/packages/modules/Connectivity/bpf/loader/NetBpfLoad.cpp
+@@ -117,6 +117,12 @@ static_assert(!minSupportedKernelVer, "NetBpfLoad must not assume min kver");
+ 
+ static unsigned int page_size = static_cast<unsigned int>(getpagesize());
+ 
++static bool useLegacyKernelBpfCompatibility() {
++    // Whyred retains the kernel-gated Android V networking BPF program set.
++    // Vendor properties may not be available this early in boot.
++    return isAtLeastKernelVersion(4, 19) && !isAtLeastKernelVersion(5, 4);
++}
++
+ typedef struct {
+     const char* program_name;
+     vector<char> data;
+@@ -1568,24 +1574,31 @@ static int doLoad(char** argv, char * const envp[]) {
+ 
+     // 25Q2 bumps the kernel requirement up to 5.4
+     // see also: //system/netd/tests/kernel_test.cpp TestKernel54
+-    if (isAtLeast25Q2 && !isAtLeastKernelVersion(5, 4)) {
++    if (isAtLeast25Q2 && !isAtLeastKernelVersion(5, 4) &&
++        !useLegacyKernelBpfCompatibility()) {
+         ALOGE("Android 25Q2 requires kernel 5.4.");
+         return 6;
+     }
+ 
+     // 25Q4 bumps the kernel requirement up to 5.10
+     // see also: //system/netd/tests/kernel_test.cpp TestKernel510
+-    if (isAtLeast25Q4 && !isAtLeastKernelVersion(5, 10)) {
++    if (isAtLeast25Q4 && !isAtLeastKernelVersion(5, 10) &&
++        !useLegacyKernelBpfCompatibility()) {
+         ALOGE("Android 25Q4 requires kernel 5.10.");
+         return 7;
+     }
+ 
+     // 26Q4 bumps the kernel requirement up to 5.15
+-    if (isAtLeast26Q4 && !isAtLeastKernelVersion(5, 15)) {
++    if (isAtLeast26Q4 && !isAtLeastKernelVersion(5, 15) &&
++        !useLegacyKernelBpfCompatibility()) {
+         ALOGE("Android 26Q4 requires kernel 5.15.");
+         return 7;
+     }
+ 
++    if (useLegacyKernelBpfCompatibility()) {
++        ALOGW("Using Android V BPF compatibility on legacy 4.19 kernel.");
++    }
++
+     // Technically already required by U, but only enforce on V+
+     // see also: //system/netd/tests/kernel_test.cpp TestKernel64Bit
+     if (isAtLeastV && isKernel32Bit() && isAtLeastKernelVersion(5, 16)) {
+diff --git a/packages/modules/Connectivity/bpf/netd/BpfHandler.cpp b/packages/modules/Connectivity/bpf/netd/BpfHandler.cpp
+index 9b57548b54d055b1da43c800da88c1d37e168566..3fd8b892d60f02e4d6bfc95a6b763243a23506b1 100644
+--- a/packages/modules/Connectivity/bpf/netd/BpfHandler.cpp
++++ b/packages/modules/Connectivity/bpf/netd/BpfHandler.cpp
+@@ -58,6 +58,10 @@ constexpr int PER_UID_STATS_ENTRIES_LIMIT = 500;
+ // map with tagged traffic entries.
+ constexpr int TOTAL_UID_STATS_ENTRIES_LIMIT = STATS_MAP_SIZE * 0.9;
+ 
++static bool useLegacyKernelBpfCompatibility() {
++    return isAtLeastKernelVersion(4, 19) && !isAtLeastKernelVersion(5, 4);
++}
++
+ static_assert(STATS_MAP_SIZE - TOTAL_UID_STATS_ENTRIES_LIMIT > 100,
+               "The limit for stats map is to high, stats data may be lost due to overflow");
+ 
+@@ -135,7 +139,8 @@ static Result<void> initPrograms(const char* cg2_path) {
+     }
+ 
+     // 25Q2 bumps the kernel requirement up to 5.4
+-    if (isAtLeast25Q2 && !isAtLeastKernelVersion(5, 4)) {
++    if (isAtLeast25Q2 && !isAtLeastKernelVersion(5, 4) &&
++        !useLegacyKernelBpfCompatibility()) {
+         return Error() << "25Q2+ platform with kernel version < 5.4.0 is unsupported";
+     }
+ 
+diff --git a/packages/modules/Connectivity/bpf/progs/netd.c b/packages/modules/Connectivity/bpf/progs/netd.c
+index e4cd7c93b40b022916697121bd9bae7cfe63362d..c65b6ef9537647a5bad15614f0f0649372c27c1d 100644
+--- a/packages/modules/Connectivity/bpf/progs/netd.c
++++ b/packages/modules/Connectivity/bpf/progs/netd.c
+@@ -1019,10 +1019,11 @@ DEFINE_NETD_BPF_PROG_RANGES(ingress, stats, 5_4, INF, T, 25Q4)
+     return bpf_traffic_account(skb, INGRESS, KVER_5_4, API(T));
+ }
+ 
+-// Android T/U/V 4.19
+-DEFINE_NETD_BPF_PROG_RANGES(ingress, stats, 4_19, 5_4, T, 25Q2)
++// Legacy 4.19 devices retain this kernel-compatible accounting program on
++// newer platform versions; the loader's version-gate exception is not enough.
++DEFINE_NETD_BPF_PROG_RANGES(ingress, stats, 4_19, 5_4, T, MAXAPI)
+ (struct __sk_buff* skb) {
+-return bpf_traffic_account(skb, INGRESS, KVER_4_19, API(T));
++    return bpf_traffic_account(skb, INGRESS, KVER_4_19, API(T));
+ }
+ 
+ // Android T 4.9 & T/U 4.14
+@@ -1075,10 +1076,10 @@ DEFINE_NETD_BPF_PROG_RANGES(egress, stats, 5_4, INF, T, 25Q4)
+     return bpf_traffic_account(skb, EGRESS, KVER_5_4, API(T));
+ }
+ 
+-// Android T/U/V 4.19
+-DEFINE_NETD_BPF_PROG_RANGES(egress, stats, 4_19, 5_4, T, 25Q2)
++// Keep the matching legacy egress program available for the same API range.
++DEFINE_NETD_BPF_PROG_RANGES(egress, stats, 4_19, 5_4, T, MAXAPI)
+ (struct __sk_buff* skb) {
+-return bpf_traffic_account(skb, EGRESS, KVER_4_19, API(T));
++    return bpf_traffic_account(skb, EGRESS, KVER_4_19, API(T));
+ }
+ 
+ // Android T 4.9 & T/U 4.14
+diff --git a/packages/modules/Connectivity/service/jni/com_android_server_connectivity_LocalNetEventListener.cpp b/packages/modules/Connectivity/service/jni/com_android_server_connectivity_LocalNetEventListener.cpp
+index 9e1c027b074de2471b082f57fbefe856a21dc4f6..32189b8bfd6146982d0ec5725341f472130e0d37 100644
+--- a/packages/modules/Connectivity/service/jni/com_android_server_connectivity_LocalNetEventListener.cpp
++++ b/packages/modules/Connectivity/service/jni/com_android_server_connectivity_LocalNetEventListener.cpp
+@@ -32,6 +32,14 @@ namespace android {
+ using android::net::eventpolling::LocalNetEventHandler;
+ 
+ static jobject nativeGetLocalNetAccessRingbufFd(JNIEnv *env, jclass clazz) {
++    // Match DEFINE_BPF_RINGBUF_EXT's minimum kernel. Legacy devices do not
++    // have this map, and constructing BpfRingbuf would abort system_server.
++    // Do not use isAtLeastKernelVersion: platform builds constant-fold its
++    // answer using the current Android release's minimum supported kernel.
++    if (bpf::kernelVersion() < KVER(5, 10, 0)) {
++        ALOGW("Local-network event reporting requires kernel 5.10 or newer");
++        return nullptr;
++    }
+     android::base::unique_fd fd = LocalNetEventHandler::GetNewRingbufFd();
+     if (!fd.ok()) {
+         ALOGE("Failed to get local net event ring buffer.");
+@@ -42,6 +50,9 @@ static jobject nativeGetLocalNetAccessRingbufFd(JNIEnv *env, jclass clazz) {
+ 
+ static jintArray nativeConsumeAllLocalNetAccessEvents(JNIEnv *env,
+                                                       jclass clazz) {
++    if (bpf::kernelVersion() < KVER(5, 10, 0)) {
++        return env->NewIntArray(0);
++    }
+     std::vector<uint32_t> uids_pids = LocalNetEventHandler::ConsumeAll();
+     if (uids_pids.empty()) {
+         return env->NewIntArray(0);
+diff --git a/packages/modules/Connectivity/service/native/libs/libeventpolling/LoopbackEventHandler.cpp b/packages/modules/Connectivity/service/native/libs/libeventpolling/LoopbackEventHandler.cpp
+index 942bbf653b0feffe28bd9cad2d99315398cc05bb..9e8d8931dd74bc1c856cb3ced5e7cf1f55bd4226 100644
+--- a/packages/modules/Connectivity/service/native/libs/libeventpolling/LoopbackEventHandler.cpp
++++ b/packages/modules/Connectivity/service/native/libs/libeventpolling/LoopbackEventHandler.cpp
+@@ -51,6 +51,11 @@ uint32_t convertLoopbackResult(uint32_t result) {
+ // static
+ bpf::RingbufEventPoller<LoopbackAccessEvent> *
+ LoopbackEventHandler::GetPoller() {
++    // The loader only creates ring-buffer maps on 5.10+ kernels.
++    // Check the runtime value, not the platform's minimum-kernel assumption.
++    if (bpf::kernelVersion() < KVER(5, 10, 0)) {
++        return nullptr;
++    }
+     static bpf::RingbufEventPoller<LoopbackAccessEvent> *const sPoller =
+         []() -> bpf::RingbufEventPoller<LoopbackAccessEvent> * {
+         auto rb = std::make_unique<BpfRingbuf<LoopbackAccessEvent>>(
+diff --git a/packages/modules/Connectivity/service/native/libs/libeventpolling/LoopbackEventHandlerTest.cpp b/packages/modules/Connectivity/service/native/libs/libeventpolling/LoopbackEventHandlerTest.cpp
+index 582d489ecc375bebc83f75fda4ed953417b30a88..0ceb7c7907db343c0ef8e039e8e9b2443f9910c2 100644
+--- a/packages/modules/Connectivity/service/native/libs/libeventpolling/LoopbackEventHandlerTest.cpp
++++ b/packages/modules/Connectivity/service/native/libs/libeventpolling/LoopbackEventHandlerTest.cpp
+@@ -24,8 +24,10 @@
+ namespace android::net::eventpolling {
+ 
+ TEST(LoopbackEventHandlerTest, StartStop) {
+-    if (!android::bpf::isAtLeastKernelVersion(5, 10)) {
+-        GTEST_SKIP() << "BPF ring buffers not supported below 5.10";
++    if (android::bpf::kernelVersion() < KVER(5, 10, 0)) {
++        ASSERT_FALSE(LoopbackEventHandler::Start());
++        LoopbackEventHandler::Stop();
++        return;
+     }
+ 
+     if (access(LOOPBACK_ACCESS_RINGBUF_NETD_PATH, R_OK)) {
+@@ -42,4 +44,4 @@ TEST(LoopbackEventHandlerTest, StartStop) {
+     LoopbackEventHandler::Stop();
+ }
+ 
+-} // namespace android::net::eventpolling
+\ No newline at end of file
++} // namespace android::net::eventpolling
+diff --git a/packages/modules/Connectivity/service/src/com/android/server/connectivity/LocalNetEventListener.java b/packages/modules/Connectivity/service/src/com/android/server/connectivity/LocalNetEventListener.java
+index e8d495ca817f5ab877e15b30a45ad12262787543..8215baffd82c3de904cc5ad3256ddd3f5f5cac91 100644
+--- a/packages/modules/Connectivity/service/src/com/android/server/connectivity/LocalNetEventListener.java
++++ b/packages/modules/Connectivity/service/src/com/android/server/connectivity/LocalNetEventListener.java
+@@ -23,6 +23,7 @@ import static com.android.server.ConnectivityStatsLog.CORE_NETWORKING_CRITICAL_C
+ import static com.android.server.ConnectivityStatsLog.CORE_NETWORKING_CRITICAL_COUNTS_EVENT_OCCURRED__EVENT_TYPE__CRITICAL_COUNTS_EVENT_TYPE_LOCAL_NETWORK_ACCESS;
+ 
+ import android.annotation.NonNull;
++import android.annotation.Nullable;
+ import android.app.AppOpsManager;
+ import android.content.Context;
+ import android.content.pm.PackageManager;
+@@ -51,7 +52,7 @@ public class LocalNetEventListener {
+     private final PackageManager mPackageManager;
+     private final AppOpsManager mAppOpsManager;
+     private final Dependencies mDeps;
+-    private final FileDescriptor mRingbufFd;
++    @Nullable private final FileDescriptor mRingbufFd;
+     private final Looper mLooper;
+     private final boolean mMetricsEnabled;
+     private final boolean mNoteOpsEnabled;
+@@ -76,6 +77,7 @@ public class LocalNetEventListener {
+     }
+ 
+     public static class Dependencies {
++        @Nullable
+         public FileDescriptor getFileDescriptor() {
+             return nativeGetLocalNetAccessRingbufFd();
+         }
+@@ -98,6 +100,11 @@ public class LocalNetEventListener {
+         if (mStarted) {
+             return;
+         }
++        if (mRingbufFd == null) {
++            Log.w(TAG, "Local-network event reporting is unavailable on this kernel");
++            mStarted = true;
++            return;
++        }
+         if (mMetricsEnabled || mNoteOpsEnabled) {
+             mLooper.getQueue().addOnFileDescriptorEventListener(mRingbufFd,
+                     EVENT_INPUT | EVENT_ERROR, this::consumeEvents);
+@@ -110,7 +117,7 @@ public class LocalNetEventListener {
+     // because in the default case we want to use the native library to correctly handle consuming
+     // the ring buffer.
+     private int consumeEvents(FileDescriptor fd, int events) {
+-        if (!mRingbufFd.equals(fd)) {
++        if (mRingbufFd == null || !mRingbufFd.equals(fd)) {
+             Log.w(TAG, "Received event for unexpected FD.");
+             return 0; // Stop listening
+         }
+@@ -174,6 +181,7 @@ public class LocalNetEventListener {
+         }
+     }
+ 
++    @Nullable
+     public static native FileDescriptor nativeGetLocalNetAccessRingbufFd();
+ 
+     public static native int[] nativeConsumeAllLocalNetAccessEvents();
+diff --git a/packages/modules/Connectivity/tests/unit/java/com/android/server/connectivity/LocalNetEventListenerTest.java b/packages/modules/Connectivity/tests/unit/java/com/android/server/connectivity/LocalNetEventListenerTest.java
+index 0a509ab445ec4a6f45230dce9cde423f284e8554..b201f52e1f45ceb01f5085f84a303f16e1d70311 100644
+--- a/packages/modules/Connectivity/tests/unit/java/com/android/server/connectivity/LocalNetEventListenerTest.java
++++ b/packages/modules/Connectivity/tests/unit/java/com/android/server/connectivity/LocalNetEventListenerTest.java
+@@ -197,6 +197,18 @@ public class LocalNetEventListenerTest {
+         verify(mDeps, never()).consumeEvents();
+     }
+ 
++    @Test
++    public void testLocalNetEventListener_missingRingbufDoesNotStart() throws Exception {
++        doReturn(null).when(mDeps).getFileDescriptor();
++        LocalNetEventListener listener = new LocalNetEventListener(mDeps, mContext,
++                Looper.getMainLooper(), true, true);
++        listener.start();
++        listener.start();
++        triggerEvent();
++        verify(mDeps, never()).consumeEvents();
++        verify(mDeps, never()).writeStats(anyInt(), anyLong());
++    }
++
+     private void triggerEvent() throws IOException {
+         // Write a single byte to the file descriptor. This makes it readable so the listener can
+         // start consuming events
+diff --git a/packages/modules/UprobeStats/bpfloader/UprobeStatsBpfLoad.cpp b/packages/modules/UprobeStats/bpfloader/UprobeStatsBpfLoad.cpp
+index a46d2d6273a0602ca89d5f7adab202eb90479a07..b5ee7e771c9ae634b115f3af0d2927ec1acab347 100644
+--- a/packages/modules/UprobeStats/bpfloader/UprobeStatsBpfLoad.cpp
++++ b/packages/modules/UprobeStats/bpfloader/UprobeStatsBpfLoad.cpp
+@@ -1061,6 +1061,13 @@ void legacyBpfLoader() {
+ }
+ 
+ void load() {
++  // Every UprobeStats object uses ring-buffer helpers (introduced in 5.8).
++  // Use the runtime value: platform minimum-kernel assumptions do not apply
++  // to upgraded legacy devices. The platform loader must still run below.
++  if (android::bpf::kernelVersion() < KVER(5, 8, 0)) {
++    ALOGI("Skipping optional UprobeStats BPF programs: kernel lacks ring buffers");
++    return;
++  }
+   if (createBpfFsSubDirectories()) {
+     return;
+   }
+diff --git a/system/bpf/loader/bpfloader.rs b/system/bpf/loader/bpfloader.rs
+index f23d8820c525e48c27ced432c622cf3acba092af..ce1abf579953bb4f489bf1b34acce973dea0382b 100644
+--- a/system/bpf/loader/bpfloader.rs
++++ b/system/bpf/loader/bpfloader.rs
+@@ -741,6 +741,23 @@ fn load_libbpf_progs() {
+     }
+ }
+ 
++fn skip_for_legacy_kernel() -> bool {
++    // This loader runs before vendor properties are reliably available. The
++    // whyred 4.19 kernel cannot load the newer platform BPF program set.
++    if let Ok(kvers) = kernel_version() {
++        if kvers < kver(5, 4, 0) {
++            return true;
++        }
++    }
++    match system_properties::read("ro.vendor.bpf.legacy_kernel_compat") {
++        Ok(value) => value.as_deref() == Some("true"),
++        Err(e) => {
++            error!("Failed to read legacy BPF compatibility property: {e}");
++            false
++        }
++    }
++}
++
+ fn main() {
+     let kmsg_fd = env::var("ANDROID_FILE__dev_kmsg").unwrap().parse::<i32>().unwrap();
+     // SAFETY: The init script opens this file for us
+@@ -755,6 +772,22 @@ fn main() {
+         error!("{panic_info}");
+     }));
+ 
++    // NetBpfLoad has already installed the kernel-gated networking programs.
++    // Preserve the completion protocol without loading incompatible platform BPF.
++    if skip_for_legacy_kernel() {
++        if let Err(e) = create_dir(Path::new("/sys/fs/bpf/netd_shared")) {
++            panic!("Failed to create legacy BPF directory: {e}");
++        }
++        if let Err(e) = create_dir(Path::new("/sys/fs/bpf/netd_shared/mainline_done")) {
++            panic!("Failed to create legacy BPF completion marker: {e}");
++        }
++        if let Err(e) = system_properties::write("bpf.progs_loaded", "1") {
++            panic!("Failed to set bpf.progs_loaded property to 1: {e}");
++        }
++        warn!("Legacy kernel compatibility enabled; skipping platform BPF loader");
++        return;
++    }
++
+     // Enable logging from libbpf
+     set_print(Some((PrintLevel::Debug, libbpf_print)));
+ 
+diff --git a/system/memory/libmeminfo/libdmabufinfo/dmabuf_bpf_stats.cpp b/system/memory/libmeminfo/libdmabufinfo/dmabuf_bpf_stats.cpp
+index 9773b918e882e9ba23569f3f1841d20c82e0565f..b8b240e00d5b76694e1d78abf766891163cc1b1b 100644
+--- a/system/memory/libmeminfo/libdmabufinfo/dmabuf_bpf_stats.cpp
++++ b/system/memory/libmeminfo/libdmabufinfo/dmabuf_bpf_stats.cpp
+@@ -17,6 +17,7 @@
+ #include "dmabuf_bpf_stats.h"
+ 
+ #include <charconv>
++#include <cerrno>
+ #include <fstream>
+ #include <string>
+ #include <utility>
+@@ -38,7 +39,11 @@ bool GetDmabufBPFStats(DmabufPerBufferStats& stats) {
+     std::ifstream in(BPF_DMABUF_ITER_PATH);
+ 
+     if (!in) {
+-        LOG(ERROR) << "Unable to access " << BPF_DMABUF_ITER_PATH;
++        // BPF iterators are optional and absent on older kernels. The caller
++        // can still fall back to sysfs; do not spam errors for a missing feature.
++        if (errno != ENOENT) {
++            LOG(ERROR) << "Unable to access " << BPF_DMABUF_ITER_PATH;
++        }
+         return false;
+     }
+ 
+diff --git a/system/memory/libmeminfo/libdmabufinfo/dmabuf_sysfs_stats.cpp b/system/memory/libmeminfo/libdmabufinfo/dmabuf_sysfs_stats.cpp
+index 7e9c773768ad51334db090d2ee416da66d3f6806..37b67a517e55440735c6a062e2d0a0c206fbf49f 100644
+--- a/system/memory/libmeminfo/libdmabufinfo/dmabuf_sysfs_stats.cpp
++++ b/system/memory/libmeminfo/libdmabufinfo/dmabuf_sysfs_stats.cpp
+@@ -20,6 +20,7 @@
+ #include <sys/types.h>
+ 
+ #include <cstdint>
++#include <cerrno>
+ #include <cstring>
+ #include <memory>
+ #include <string>
+@@ -52,7 +53,11 @@ bool GetDmabufSysfsStats(DmabufPerBufferStats& stats, const std::string& dmabuf_
+     std::unique_ptr<DIR, int (*)(DIR*)> dir(opendir(dmabuf_sysfs_stats_path.c_str()), closedir);
+ 
+     if (!dir) {
+-        PLOG(ERROR) << "Unable to access: " << dmabuf_sysfs_stats_path;
++        // CONFIG_DMABUF_SYSFS_STATS is optional. Report unsupported via false
++        // without hiding permission errors or errors in existing statistics.
++        if (errno != ENOENT) {
++            PLOG(ERROR) << "Unable to access: " << dmabuf_sysfs_stats_path;
++        }
+         return false;
+     }
+ 
+diff --git a/system/memory/libmeminfo/libdmabufinfo/dmabufinfo_test.cpp b/system/memory/libmeminfo/libdmabufinfo/dmabufinfo_test.cpp
+index 2aab9ff9a1731210713b147b3efd79a627c00fe4..425dad60b16493d2a32b10bd48c498d98fa6afb4 100644
+--- a/system/memory/libmeminfo/libdmabufinfo/dmabufinfo_test.cpp
++++ b/system/memory/libmeminfo/libdmabufinfo/dmabufinfo_test.cpp
+@@ -187,6 +187,14 @@ class DmaBufSysfsStatsParser : public ::testing::Test {
+     std::filesystem::path buffer_stats_path;
+ };
+ 
++TEST(DmaBufFeatureAvailability, MissingSysfsFeatureReturnsUnavailable) {
++    TemporaryDir temporary_dir;
++    ASSERT_NE('\0', temporary_dir.path[0]);
++    DmabufPerBufferStats stats;
++    ASSERT_FALSE(GetDmabufSysfsStats(stats,
++                                   std::string(temporary_dir.path) + "/missing-buffers"));
++}
++
+ TEST_F(DmaBufSysfsStatsParser, TestReadDmaBufSysfsStats) {
+     using android::base::StringPrintf;
+ 
+diff --git a/system/memory/libmeminfo/sysmeminfo.cpp b/system/memory/libmeminfo/sysmeminfo.cpp
+index c014987916efbe68b37421bea65ff538ab2a8d4f..dadd62d30799787a3e829f5bad70f384d6d6bbcd 100644
+--- a/system/memory/libmeminfo/sysmeminfo.cpp
++++ b/system/memory/libmeminfo/sysmeminfo.cpp
+@@ -21,6 +21,7 @@
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
++#include <sys/utsname.h>
+ #include <unistd.h>
+ 
+ #include <algorithm>
+@@ -415,6 +416,16 @@ bool ReadPerProcessGpuMem([[maybe_unused]] std::unordered_map<uint32_t, uint64_t
+ #if defined(__ANDROID__) && !defined(__ANDROID_APEX__) && !defined(__ANDROID_VNDK__)
+     static constexpr const char kBpfGpuMemTotalMap[] = "/sys/fs/bpf/map_gpuMem_gpu_mem_total_map";
+ 
++    // The legacy 4.19 GPU map has an incompatible layout. Opening it through
++    // BpfMapRO can abort system_server instead of reporting unavailable stats.
++    struct utsname uts;
++    int kernel_major = 0;
++    if (uname(&uts) == 0 && sscanf(uts.release, "%d", &kernel_major) == 1 &&
++        kernel_major < 5) {
++        if (out) out->clear();
++        return false;
++    }
++
+     // Use the read-only wrapper BpfMapRO to properly retrieve the read-only map.
+     auto map = bpf::BpfMapRO<uint64_t, uint64_t>(kBpfGpuMemTotalMap);
+     if (!map.isValid()) {
+@@ -464,6 +475,15 @@ bool ReadProcessGpuUsageKb([[maybe_unused]] uint32_t pid, [[maybe_unused]] uint3
+ #if defined(__ANDROID__) && !defined(__ANDROID_APEX__) && !defined(__ANDROID_VNDK__)
+     static constexpr const char kBpfGpuMemTotalMap[] = "/sys/fs/bpf/map_gpuMem_gpu_mem_total_map";
+ 
++    // GPU accounting is optional on the legacy kernel; avoid its incompatible map.
++    struct utsname uts;
++    int kernel_major = 0;
++    if (uname(&uts) == 0 && sscanf(uts.release, "%d", &kernel_major) == 1 &&
++        kernel_major < 5) {
++        if (size) *size = 0;
++        return false;
++    }
++
+     uint64_t gpu_mem;
+ 
+     // BPF Key [32-bits GPU ID | 32-bits PID]
+diff --git a/system/vold/model/PublicVolume.cpp b/system/vold/model/PublicVolume.cpp
+index bf7aaa6b8bf3222e593c58a7437e328770056ed3..c1020a3e000ede9ba21e426e8f7dff5b1ba75030 100644
+--- a/system/vold/model/PublicVolume.cpp
++++ b/system/vold/model/PublicVolume.cpp
+@@ -26,6 +26,8 @@
+ #include "fs/Ntfs.h"
+ #include "fs/Vfat.h"
+ 
++#include <algorithm>
++
+ #include <android-base/logging.h>
+ #include <android-base/properties.h>
+ #include <android-base/stringprintf.h>
+diff --git a/vendor/lineage/config/BoardConfigLineage.mk b/vendor/lineage/config/BoardConfigLineage.mk
+index 94564ae5cc186d753da7141517f30f3b098712c4..f5b33574f35b510db6bbdfb54564710ed4695585 100644
+--- a/vendor/lineage/config/BoardConfigLineage.mk
++++ b/vendor/lineage/config/BoardConfigLineage.mk
+@@ -3,6 +3,9 @@
+ 
+ # build-manifest.xml
+ BUILD_BROKEN_SRC_DIR_RW_ALLOWLIST := $(abspath .repo/manifests.git)
++ifneq ($(filter kernel/xiaomi/sdm660,$(TARGET_KERNEL_SOURCE)),)
++BUILD_BROKEN_SRC_DIR_RW_ALLOWLIST += $(abspath $(TARGET_KERNEL_SOURCE))
++endif
+ 
+ # Recovery
+ BOARD_USES_FULL_RECOVERY_IMAGE ?= true
+diff --git a/vendor/lineage/config/common.mk b/vendor/lineage/config/common.mk
+index c3a9eedfd7f6bcef1874a3fd05b03670271f841f..83261a1f1d2cd79efdba9f6abe677a8ed7c67444 100644
+--- a/vendor/lineage/config/common.mk
++++ b/vendor/lineage/config/common.mk
+@@ -240,8 +240,10 @@ PRODUCT_ARTIFACT_PATH_REQUIREMENT_ALLOWED_LIST += \
+ endif
+ 
+ # Root
++ifneq ($(TARGET_EXCLUDE_ADB_ROOT),true)
+ PRODUCT_PACKAGES += \
+     adb_root
++endif
+ ifneq ($(TARGET_BUILD_VARIANT),user)
+ ifeq ($(WITH_SU),true)
+ PRODUCT_PACKAGES += \
+diff --git a/vendor/lineage/tools/clean_headers.sh b/vendor/lineage/tools/clean_headers.sh
+index 3a12160ca13e86048391c781787331ed913e93d9..1f4197f2fc38de5db62da930edec44bfc5a5945c 100755
+--- a/vendor/lineage/tools/clean_headers.sh
++++ b/vendor/lineage/tools/clean_headers.sh
+@@ -7,3 +7,10 @@ export ANDROID_BUILD_TOP="$PWD"
+     "$1/usr/include/asm/signal.h" \
+     "$1/usr/include/asm-generic/signal.h" \
+     "$1/usr/include/linux/eventpoll.h"
++
++# Bionic provides struct sched_param from sched.h. Older vendor kernels still
++# export the duplicate definition from linux/sched/types.h.
++if [ -f "$1/usr/include/linux/sched/types.h" ]; then
++    sed -i '/^struct sched_param {$/,/^};$/d' \
++        "$1/usr/include/linux/sched/types.h"
++fi
+diff --git a/vendor/qcom/opensource/commonsys-intf/display/Android.bp b/vendor/qcom/opensource/commonsys-intf/display/Android.bp
+index f345066b9cc7f1b04a7d582d56e16ab9cacd0ec8..bd577c54f0dcc73919f9c731f1e3f905bfcc6b77 100644
+--- a/vendor/qcom/opensource/commonsys-intf/display/Android.bp
++++ b/vendor/qcom/opensource/commonsys-intf/display/Android.bp
+@@ -1,6 +1,25 @@
+ soong_namespace {
+ }
+ 
++// Devices with the original gralloc1 handle layout install matching metadata
++// implementations under the original sonames, not the newer QSSI ones.
++soong_config_module_type {
++    name: "whyred_metadata_cc_defaults",
++    module_type: "cc_defaults",
++    config_namespace: "whyred_legacy_display",
++    bool_variables: ["enabled"],
++    properties: ["installable"],
++}
++
++whyred_metadata_cc_defaults {
++    name: "whyred_metadata_install_defaults",
++    soong_config_variables: {
++        enabled: {
++            installable: false,
++        },
++    },
++}
++
+ cc_library_headers {
+     name: "display_intf_headers",
+     vendor_available: true,
+diff --git a/vendor/qcom/opensource/commonsys/display/libqdmetadata/Android.bp b/vendor/qcom/opensource/commonsys/display/libqdmetadata/Android.bp
+index 181eb163f057d8d71e0a9cb7107fa0e1fbb96690..88705fae171b7ea15a24b9d2d2916bea96c5bcdb 100644
+--- a/vendor/qcom/opensource/commonsys/display/libqdmetadata/Android.bp
++++ b/vendor/qcom/opensource/commonsys/display/libqdmetadata/Android.bp
+@@ -1,5 +1,6 @@
+ cc_library_shared {
+     name: "libqdMetaData.system",
++    defaults: ["whyred_metadata_install_defaults"],
+     system_ext_specific: true,
+     cflags: [
+         "-Wno-sign-conversion",
+diff --git a/vendor/qcom/opensource/data-ipa-cfg-mgr-legacy-um/ipacm/inc/IPACM_OffloadManager.h b/vendor/qcom/opensource/data-ipa-cfg-mgr-legacy-um/ipacm/inc/IPACM_OffloadManager.h
+index 146fde8a6a25914249e72f529763851ba0b73256..b2ead9dad2f3fdd6b1446102d0beb3ad7dba9cd1 100644
+--- a/vendor/qcom/opensource/data-ipa-cfg-mgr-legacy-um/ipacm/inc/IPACM_OffloadManager.h
++++ b/vendor/qcom/opensource/data-ipa-cfg-mgr-legacy-um/ipacm/inc/IPACM_OffloadManager.h
+@@ -30,6 +30,7 @@
+ #define _IPACM_OFFLOAD_MANAGER_H_
+ 
+ #include <list>
++#include <vector>
+ #include <stdint.h>
+ #include <IOffloadManager.h>
+ #include "IPACM_Defs.h"
+diff --git a/vendor/qcom/opensource/display/libqdmetadata/Android.bp b/vendor/qcom/opensource/display/libqdmetadata/Android.bp
+index 235fe653def52533869b6b0ef10d67686c13a2e1..3f82a9b56603e54f69fde0a46d21900c580519c3 100644
+--- a/vendor/qcom/opensource/display/libqdmetadata/Android.bp
++++ b/vendor/qcom/opensource/display/libqdmetadata/Android.bp
+@@ -1,5 +1,6 @@
+ cc_library_shared {
+     name: "libqdMetaData",
++    defaults: ["whyred_metadata_install_defaults"],
+     vendor: true,
+     cflags: [
+         "-Wno-sign-conversion",
+diff --git a/vendor/qcom/opensource/vibrator/aidl/VibratorSelector/VibratorSelector.h b/vendor/qcom/opensource/vibrator/aidl/VibratorSelector/VibratorSelector.h
+index 3076c444be6c6080ab0b7e3650c85b0cb3520d91..cc85d2693c25f98e2f58bcc2623205b799a74562 100644
+--- a/vendor/qcom/opensource/vibrator/aidl/VibratorSelector/VibratorSelector.h
++++ b/vendor/qcom/opensource/vibrator/aidl/VibratorSelector/VibratorSelector.h
+@@ -36,6 +36,9 @@
+ #ifndef VIBRATOR_SELECTOR_H
+ #define VIBRATOR_SELECTOR_H
+ 
++#include <cstdint>
++#include <memory>
++#include <string>
+ #include <vector>
+ #include <expat.h>
+ 
+@@ -82,4 +85,4 @@ private:
+     static vibrator_type vibForPwle;
+     static std::shared_ptr <VibratorSelector> me_;
+ };
+-#endif
+\ No newline at end of file
++#endif
+diff --git a/.repo/local_manifests/bouquet.xml b/.repo/local_manifests/bouquet.xml
+--- a/.repo/local_manifests/bouquet.xml
++++ b/.repo/local_manifests/bouquet.xml
+@@ -1,29 +1,18 @@
+ <?xml version="1.0" encoding="UTF-8"?>
+ <manifest>
+     <remote name="bouquet" fetch="https://github.com/podhorsky-ksj"/>
+-    <remote name="whyred" fetch="https://github.com/user-why-red"/>
+     <remote name="lineage" fetch="https://github.com/LineageOS"/>
+-    <remove-project path="frameworks/base" />
+-    <project path="frameworks/base" name="android_frameworks_base" remote="bouquet" revision="lineage-24.0" groups="pdk-cw-fs,pdk-fs,sysui-studio" />
+-    <remove-project path="vendor/lineage" />
+-    <project path="vendor/lineage" name="android_vendor_lineage" remote="bouquet" revision="lineage-24.0" />
+     <project path="device/xiaomi/bouquet-common" name="android_device_xiaomi_bouquet-common" remote="bouquet" revision="lineage-24.0" />
+     <project path="device/xiaomi/bouquet" name="android_device_xiaomi_whyred" remote="bouquet" revision="lineage-24.0" />
+ 
+    <project path="vendor/xiaomi/bouquet-common" name="android_vendor_xiaomi_bouquet-common" remote="bouquet" revision="lineage-24.0" />
+    <project path="vendor/xiaomi/bouquet" name="android_vendor_xiaomi_whyred" remote="bouquet" revision="lineage-24.0" />
+ 
+-	<project path="hardware/xiaomi" name="android_hardware_xiaomi" remote="lineage" revision="lineage-24.0" />
+-	<remove-project path="hardware/qcom-caf/sdm660/audio" />
+-	<project path="hardware/qcom-caf/sdm660/audio" name="android_hardware_qcom_audio" remote="bouquet" revision="lineage-24.0-caf-sdm660" />
+-	<remove-project path="hardware/qcom-caf/sdm660/media" />
+-	<project path="hardware/qcom-caf/sdm660/media" name="android_hardware_qcom_media" remote="bouquet" revision="lineage-24.0-caf-sdm660" />
++   <project path="hardware/xiaomi" name="android_hardware_xiaomi" remote="lineage" revision="lineage-24.0" />
+ 	
+ 
+-   <!-- LineageOS 24.0 provides sdm660/display. Replace it with the Bouquet
+-        display fork at the path consumed by the build. -->
+    <remove-project path="hardware/qcom-caf/sdm660/display" />
+    <project path="hardware/qcom-caf/sdm660/display" name="android_hardware_qcom_display" remote="bouquet" revision="sdm660-4.19" />
+ 
+-   <project path="kernel/xiaomi/sdm660" name="android_kernel_xiaomi_sdm660_419" remote="whyred" revision="back" />
++   <project path="kernel/xiaomi/sdm660" name="android_kernel_xiaomi_sdm660_419" remote="bouquet" revision="back" />
+ </manifest>
