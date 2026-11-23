@@ -307,6 +307,48 @@ index 10973417e84083039a86fbf24b40f254b4e00799..e924c1866c8664fd457b1d054eac86ce
      return createDefault();
  }
  
+diff --git a/frameworks/base/core/java/android/os/RecoverySystem.java b/frameworks/base/core/java/android/os/RecoverySystem.java
+index de995527eea8c3dfb345244a1ebd64e72d6301dc..9a84a6bd25d8cead2988d9b08cbf460f596413f2 100644
+--- a/frameworks/base/core/java/android/os/RecoverySystem.java
++++ b/frameworks/base/core/java/android/os/RecoverySystem.java
+@@ -519,6 +519,17 @@ public class RecoverySystem {
+             };
+         }
+ 
++        // Uncrypt may rewrite encrypted file blocks for recovery. Read ZIP metadata
++        // and reserve compressed APEX space before the filesystem view becomes invalid.
++        try {
++            if (!rs.allocateSpaceForUpdate(packageFile)) {
++                throw new IOException("Failed to allocate space for update "
++                        + packageFile.getAbsolutePath());
++            }
++        } catch (RemoteException e) {
++            throw new IOException("Failed to allocate space for update", e);
++        }
++
+         if (!rs.uncrypt(filename, progressListener)) {
+             throw new IOException("process package failed");
+         }
+@@ -596,6 +607,10 @@ public class RecoverySystem {
+             // If the package name ends with "_s.zip", it's a security update.
+             boolean securityUpdate = filename.endsWith("_s.zip");
+ 
++            // processPackage already reserved space before uncrypting a /data package.
++            // Its filesystem view may no longer contain a readable ZIP after uncrypt.
++            final boolean processedDataPackage = processed && filename.startsWith("/data/");
++
+             // If the package is on the /data partition, the package needs to
+             // be processed (i.e. uncrypt'd). The caller specifies if that has
+             // been done in 'processed' parameter.
+@@ -643,7 +658,7 @@ public class RecoverySystem {
+                 throw new IOException("Setup BCB failed");
+             }
+             try {
+-                if (!rs.allocateSpaceForUpdate(packageFile)) {
++                if (!processedDataPackage && !rs.allocateSpaceForUpdate(packageFile)) {
+                     rs.clearBcb();
+                     throw new IOException("Failed to allocate space for update "
+                             + packageFile.getAbsolutePath());
 diff --git a/frameworks/base/media/java/android/media/AudioHalVersionInfo.java b/frameworks/base/media/java/android/media/AudioHalVersionInfo.java
 index 3e456a65c2e42a2a5093bcb4b407fa15130b3f9a..2b6f72eabeec31c79826d20335be0f365f8bc193 100644
 --- a/frameworks/base/media/java/android/media/AudioHalVersionInfo.java
@@ -963,6 +1005,40 @@ index bd822f04f02f6336d40f7ade7bdf6170f0cef92f..05e4633cdaa44f485d71f5db5a69fdb2
  #include "UdfpsHandler.h"
  #include "fingerprint.h"
  
+diff --git a/packages/apps/Updater/app/src/main/java/org/lineageos/updater/controller/UpdateInstaller.java b/packages/apps/Updater/app/src/main/java/org/lineageos/updater/controller/UpdateInstaller.java
+index de873500d6dee3303621d69b6465965ca0b8ba32..0dea2989363f1b72f714872524cddbd4b46ce235 100644
+--- a/packages/apps/Updater/app/src/main/java/org/lineageos/updater/controller/UpdateInstaller.java
++++ b/packages/apps/Updater/app/src/main/java/org/lineageos/updater/controller/UpdateInstaller.java
+@@ -88,8 +88,12 @@ class UpdateInstaller {
+     }
+ 
+     private void installPackage(File update, String downloadId) {
++        installPackage(update, downloadId, false);
++    }
++
++    private void installPackage(File update, String downloadId, boolean processed) {
+         try {
+-            android.os.RecoverySystem.installPackage(mContext, update);
++            android.os.RecoverySystem.installPackage(mContext, update, processed);
+         } catch (IOException e) {
+             Log.e(TAG, "Could not install update", e);
+             mUpdaterController.setUpdate(downloadId, mUpdaterController.getUpdate(downloadId)
+@@ -125,10 +129,13 @@ class UpdateInstaller {
+                         //noinspection ResultOfMethodCallIgnored
+                         uncryptFile.delete();
+                     } else {
+-                        installPackage(uncryptFile, update.getDownloadId());
++                        // Prepare encrypted-storage access before rebooting. RecoverySystem's
++                        // processed install path verifies that the block map is ready.
++                        android.os.RecoverySystem.processPackage(mContext, uncryptFile, null);
++                        installPackage(uncryptFile, update.getDownloadId(), true);
+                     }
+                 } catch (IOException e) {
+-                    Log.e(TAG, "Could not copy update", e);
++                    Log.e(TAG, "Could not prepare update", e);
+                     //noinspection ResultOfMethodCallIgnored
+                     uncryptFile.delete();
+                     mUpdaterController.setUpdate(update.getDownloadId(), mUpdaterController.getUpdate(update.getDownloadId())
 diff --git a/packages/apps/Updater/app/src/main/java/org/lineageos/updater/data/source/network/UpdatesNetworkDataSource.kt b/packages/apps/Updater/app/src/main/java/org/lineageos/updater/data/source/network/UpdatesNetworkDataSource.kt
 index 2f1407f73d8fbc8c894aa34130fa2620a5cfdc39..a0776f92f6a3167a352da93fe723e6c28567a433 100644
 --- a/packages/apps/Updater/app/src/main/java/org/lineageos/updater/data/source/network/UpdatesNetworkDataSource.kt
@@ -1742,7 +1818,6 @@ index 3076c444be6c6080ab0b7e3650c85b0cb3520d91..cc85d2693c25f98e2f58bcc2623205b7
 -#endif
 \ No newline at end of file
 +#endif
-diff --git a/.repo/local_manifests/bouquet.xml b/.repo/local_manifests/bouquet.xml
 --- a/.repo/local_manifests/bouquet.xml
 +++ b/.repo/local_manifests/bouquet.xml
 @@ -1,29 +1,18 @@
