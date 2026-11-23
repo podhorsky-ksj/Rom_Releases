@@ -3,7 +3,7 @@
 Notes:
 * This is a FBEv2 ROM with NO way to disable encryption (at least not for now)
 * Enforced and encrypted
-* With [SukiSU](https://github.com/SukiSU-Ultra/SukiSU-Ultra)
+* With [BakaSU](https://github.com/Baka-SU/BakaSU)
 * With [MindTheGapps](https://github.com/MindTheGapps/16.0.0-arm64)
 * With [Kernel](https://github.com/user-why-red/android_kernel_xiaomi_sdm660_419)
 * With Whyred repos from [NopeNopeGuy](https://github.com/NopeNopeGuy) [Whyred](https://github.com/Bouquet-Dynamic-Development)
